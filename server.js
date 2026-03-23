@@ -273,8 +273,8 @@ function sendQuestion(room) {
   const q = room.questions[room.currentQ];
   if (!q) return;
 
-  room.questionStartTime = Date.now();
   room.players.filter(p => !p.eliminated).forEach(p => { p.answered = false; });
+  room.acceptingAnswers = false; // Block answers during grace period
 
   // Send question to all players — but WITHOUT the correct answer!
   broadcast(room, {
@@ -288,17 +288,26 @@ function sendQuestion(room) {
     // NOTE: we do NOT send q.a (correct answer) — that stays on the server
   });
 
-  // Start question timer
-  room.questionTimer = setTimeout(() => {
-    // Time's up — score anyone who hasn't answered as wrong
-    room.players.filter(p => !p.eliminated && !p.answered).forEach(p => {
-      p.answered = true;
-    });
-    revealAnswer(room);
-  }, TIMER_SECS * 1000);
+  // 1-second grace period — let everyone read the question before timer starts
+  setTimeout(() => {
+    room.questionStartTime = Date.now();
+    room.acceptingAnswers = true;
 
-  // Trigger bot answers
-  room.players.filter(p => p.isBot && !p.eliminated).forEach(p => botAnswerQuestion(room, p));
+    // Tell clients to start their timers
+    broadcast(room, { type: 'timer_start' });
+
+    // Start question timer
+    room.questionTimer = setTimeout(() => {
+      // Time's up — score anyone who hasn't answered as wrong
+      room.players.filter(p => !p.eliminated && !p.answered).forEach(p => {
+        p.answered = true;
+      });
+      revealAnswer(room);
+    }, TIMER_SECS * 1000);
+
+    // Trigger bot answers
+    room.players.filter(p => p.isBot && !p.eliminated).forEach(p => botAnswerQuestion(room, p));
+  }, 1000);
 
   // Start bot emotes if not already running
   if (!room.botEmoteInterval) startBotEmotes(room);
@@ -308,6 +317,7 @@ function handleAnswer(room, playerIndex, answerIndex) {
   const player = room.players[playerIndex];
   if (!player || player.eliminated || player.answered) return;
   if (room.phase !== 'playing') return;
+  if (!room.acceptingAnswers) return; // Grace period still active
 
   player.answered = true;
   const q = room.questions[room.currentQ];

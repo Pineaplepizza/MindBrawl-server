@@ -38,7 +38,7 @@ const TOPICS = [
   {id:'music',name:'Music',icon:'🎵',desc:'Artists, albums, genres',color:'192,132,252'},
   {id:'tech',name:'Technology',icon:'💻',desc:'Gadgets, software, internet',color:'96,165,250'},
   {id:'space',name:'Space',icon:'🚀',desc:'Planets, stars, missions',color:'199,210,254'},
-  {id:'art',name:'Art & Literature',icon:'🎨',desc:'Paintings, books, authors',color:'244,114,182'},
+  {id:'anime',name:'Anime & Manga',icon:'🎌',desc:'Shonen, heroes, studios',color:'244,114,182'},
   {id:'games',name:'Video Games',icon:'🎮',desc:'Consoles, titles, characters',color:'163,230,53'},
   {id:'mythology',name:'Mythology',icon:'⚡',desc:'Gods, legends, folklore',color:'253,164,75'},
   {id:'harrypotter',name:'Harry Potter',icon:'🧙',desc:'Wizards, spells, Hogwarts',color:'139,92,246'},

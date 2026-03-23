@@ -241,10 +241,15 @@ function startRound(room) {
     p.answered = false;
   });
 
-  // Build 5 questions (one per topic)
+  // Build 5 questions (one per topic), avoiding repeats from earlier rounds
+  if (!room.usedQuestions) room.usedQuestions = {};
   room.questions = room.topics.map(topic => {
     const pool = QUESTIONS_DB[topic.id] || [];
-    const q = pool[Math.floor(Math.random() * pool.length)];
+    if (!room.usedQuestions[topic.id]) room.usedQuestions[topic.id] = [];
+    const available = pool.filter((_, i) => !room.usedQuestions[topic.id].includes(i));
+    const src = available.length ? available : pool;
+    const q = src[Math.floor(Math.random() * src.length)];
+    room.usedQuestions[topic.id].push(pool.indexOf(q));
     return { ...q, topicId: topic.id, topicName: topic.name, topicIcon: topic.icon };
   });
 

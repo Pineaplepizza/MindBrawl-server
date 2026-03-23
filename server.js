@@ -349,7 +349,7 @@ function revealAnswer(room) {
 
 function getScoreboard(room) {
   return room.players
-    .filter(p => !p.eliminated)
+    .filter(p => !p.eliminated && !p.disconnected)
     .map(p => ({
       index: p.index,
       name: p.name,
@@ -656,13 +656,78 @@ wss.on('connection', (ws) => {
       const room = rooms.get(info.roomId);
       if (room) {
         const player = room.players[info.playerIndex];
-        if (player) {
+        if (player && !player.eliminated) {
           player.disconnected = true;
+          player.eliminated = true;
+          player.answered = true; // Don't wait for their answer
+          
           broadcast(room, {
             type: 'player_disconnected',
             playerIndex: info.playerIndex,
             name: player.name,
           });
+
+          console.log(`${player.name} disconnected from room ${room.id}`);
+
+          // Check if enough players remain
+          const remaining = room.players.filter(p => !p.eliminated);
+          
+          if (remaining.length < 2) {
+            // Not enough players — end the game
+            clearTimeout(room.questionTimer);
+            clearTimeout(room.topicTimer);
+            if (remaining.length === 1) {
+              // Last player standing wins
+              const winner = remaining[0];
+              broadcast(room, {
+                type: 'game_over',
+                standings: room.players.map((p, i) => ({
+                  index: p.index, name: p.name,
+                  totalScore: p.score || 0,
+                  place: p === winner ? 1 : p.eliminated ? (room.players.filter(x => x.eliminated).indexOf(p) + 2) : 2,
+                })).sort((a, b) => a.place - b.place),
+                winnerIndex: winner.index,
+                winnerName: winner.name,
+              });
+            }
+            // Clean up room
+            setTimeout(() => {
+              room.players.forEach(p => playerMap.delete(p.ws));
+              rooms.delete(room.id);
+            }, 5000);
+            return;
+          }
+
+          // If in playing phase, check if all remaining players have answered
+          if (room.phase === 'playing') {
+            const active = room.players.filter(p => !p.eliminated);
+            if (active.every(p => p.answered)) {
+              clearTimeout(room.questionTimer);
+              setTimeout(() => revealAnswer(room), 300);
+            }
+          }
+
+          // If in topic_selection phase, check if all remaining players have picked
+          if (room.phase === 'topic_selection') {
+            const active = room.players.filter(p => !p.eliminated);
+            if (active.every(p => p.topicPick)) {
+              clearTimeout(room.topicTimer);
+              setTimeout(() => finishTopicSelection(room), 500);
+            }
+          }
+
+          // If in sudden_death phase, resolve it
+          if (room.phase === 'sudden_death' && room.sdPlayers) {
+            const sdOpponent = room.sdPlayers.find(p => p !== player);
+            if (sdOpponent) {
+              clearTimeout(room.questionTimer);
+              setTimeout(() => {
+                const sorted = [sdOpponent, player];
+                const allActive = room.players.filter(p => !p.disconnected);
+                endGame(room, [...sorted, ...allActive.filter(p => p !== sdOpponent && p !== player)]);
+              }, 1000);
+            }
+          }
         }
       }
       playerMap.delete(ws);

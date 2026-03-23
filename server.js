@@ -73,9 +73,9 @@ function shuffle(arr) {
   return a;
 }
 
-// Send a JSON message to one player
+// Send a JSON message to one player (skip bots)
 function send(ws, data) {
-  if (ws.readyState === 1) { // 1 = OPEN
+  if (ws && ws.readyState === 1) {
     ws.send(JSON.stringify(data));
   }
 }
@@ -98,47 +98,56 @@ function createRoom(players) {
   const roomId = generateId();
   const room = {
     id: roomId,
-    players: players.map((p, i) => ({
-      ws: p.ws,
-      name: p.name,
-      index: i,
-      score: 0,
-      roundScore: 0,
-      roundCorrect: 0,
-      roundTime: 0,
-      roundTotalTime: 0,
-      eliminated: false,
-      topicPick: null,
-      answered: false,
-      answerTime: 0,
-    })),
+    players: players.map((p, i) => {
+      if (p.isBot && p.botData) {
+        // Bot player
+        return { ...p.botData, index: i };
+      }
+      return {
+        ws: p.ws,
+        name: p.name,
+        index: i,
+        score: 0,
+        roundScore: 0,
+        roundCorrect: 0,
+        roundTime: 0,
+        roundTotalTime: 0,
+        eliminated: false,
+        topicPick: null,
+        answered: false,
+        answerTime: 0,
+      };
+    }),
     round: 1,
     currentQ: 0,
-    topics: [],         // 5 topics chosen for the game
-    questions: [],      // 5 questions for current round
+    topics: [],
+    questions: [],
     questionStartTime: null,
     topicTimer: null,
     questionTimer: null,
-    phase: 'topic_selection', // topic_selection | playing | round_end | finished
+    botEmoteInterval: null,
+    phase: 'topic_selection',
   };
 
   rooms.set(roomId, room);
 
-  // Tell each player about the room and all other players
+  // Tell each REAL player about the room and all other players
   room.players.forEach(p => {
-    playerMap.set(p.ws, { roomId, playerIndex: p.index });
-    send(p.ws, {
-      type: 'match_found',
-      roomId,
-      yourIndex: p.index,
-      players: room.players.map(pl => ({ name: pl.name, index: pl.index }))
-    });
+    if (p.ws) {
+      playerMap.set(p.ws, { roomId, playerIndex: p.index });
+      send(p.ws, {
+        type: 'match_found',
+        roomId,
+        yourIndex: p.index,
+        players: room.players.map(pl => ({ name: pl.name, index: pl.index }))
+      });
+    }
   });
 
   // Start topic selection after a short delay
   setTimeout(() => startTopicSelection(room), 1500);
 
-  console.log(`Room ${roomId} created with ${room.players.length} players`);
+  console.log(`Room ${roomId} created with ${room.players.filter(p=>!p.isBot).length} real + ${room.players.filter(p=>p.isBot).length} bot players`);
   return room;
 }
 
@@ -160,6 +169,9 @@ function startTopicSelection(room) {
 
   // Broadcast to everyone that topic selection started
   broadcast(room, { type: 'topic_phase_start', round: room.round });
+
+  // Trigger bot topic picks
+  room.players.filter(p => p.isBot && !p.eliminated).forEach(p => botPickTopic(room, p));
 
   // Start 10-second timer — auto-pick for anyone who hasn't chosen
   room.topicTimer = setTimeout(() => {
@@ -284,6 +296,12 @@ function sendQuestion(room) {
     });
     revealAnswer(room);
   }, TIMER_SECS * 1000);
+
+  // Trigger bot answers
+  room.players.filter(p => p.isBot && !p.eliminated).forEach(p => botAnswerQuestion(room, p));
+
+  // Start bot emotes if not already running
+  if (!room.botEmoteInterval) startBotEmotes(room);
 }
 
 function handleAnswer(room, playerIndex, answerIndex) {
@@ -441,6 +459,9 @@ function startSuddenDeath(room, p1, p2) {
     // Time's up — whoever answered correctly first wins, or p1 by default
     resolveSuddenDeath(room);
   }, TIMER_SECS * 1000);
+
+  // Trigger bot answers in sudden death
+  [p1, p2].filter(p => p.isBot).forEach(p => botAnswerSuddenDeath(room, p));
 }
 
 function handleSuddenDeathAnswer(room, playerIndex, answerIndex) {
@@ -499,6 +520,7 @@ function resolveSuddenDeath(room) {
 
 function endGame(room, sorted) {
   room.phase = 'finished';
+  clearInterval(room.botEmoteInterval);
 
   // Include eliminated players for full final standings
   const eliminated = room.players.filter(p => p.eliminated).reverse();
@@ -534,6 +556,124 @@ function handleEmote(room, playerIndex, emoji) {
   });
 }
 
+// ── BOT SYSTEM ──
+const BOT_NAMES = ['Alex','Jordan','Sam','Riley','Morgan','Casey','Quinn','Avery','Blake','Drew','Skyler','Sage','Rowan','Harper','Reese','Dakota','Finley','Emery','Hayden','Logan'];
+const BOT_EMOTES = ['😂','😱','🤯','👏','💀','😤','🥶','👀'];
+
+function createBot(name) {
+  return {
+    ws: null,
+    name: name,
+    isBot: true,
+    score: 0,
+    roundScore: 0,
+    roundCorrect: 0,
+    roundTime: 0,
+    roundTotalTime: 0,
+    eliminated: false,
+    topicPick: null,
+    answered: false,
+    answerTime: 0,
+    botAccuracy: 0.55 + Math.random() * 0.15, // 55-70% per bot
+  };
+}
+
+function getBotNames(count) {
+  const shuffled = shuffle([...BOT_NAMES]);
+  // Avoid names already in queue
+  const taken = new Set(queue.map(p => p.name));
+  return shuffled.filter(n => !taken.has(n)).slice(0, count);
+}
+
+// Bot auto-pick topic after random delay
+function botPickTopic(room, player) {
+  if (!player.isBot || player.eliminated || player.topicPick) return;
+  const delay = 1500 + Math.random() * 4000;
+  setTimeout(() => {
+    if (player.topicPick || room.phase !== 'topic_selection') return;
+    const topic = player.topicOptions[Math.floor(Math.random() * player.topicOptions.length)];
+    handleTopicPick(room, player.index, topic.id);
+  }, delay);
+}
+
+// Bot auto-answer question after random delay
+function botAnswerQuestion(room, player) {
+  if (!player.isBot || player.eliminated || player.answered) return;
+  const delay = 2000 + Math.random() * 5000; // 2-7 seconds
+  const timeout = setTimeout(() => {
+    if (player.answered || room.phase !== 'playing') return;
+    const q = room.questions[room.currentQ];
+    if (!q) return;
+    const correct = Math.random() < player.botAccuracy;
+    const answerIndex = correct ? q.a : [0,1,2,3].filter(i => i !== q.a)[Math.floor(Math.random() * 3)];
+    handleAnswer(room, player.index, answerIndex);
+  }, delay);
+  // Store timeout so we can clear on disconnect
+  player._botAnswerTimeout = timeout;
+}
+
+// Bot auto-answer sudden death
+function botAnswerSuddenDeath(room, player) {
+  if (!player.isBot) return;
+  const delay = 2000 + Math.random() * 5000;
+  setTimeout(() => {
+    if (room.sdAnswers[player.index] !== undefined || room.phase !== 'sudden_death') return;
+    const correct = Math.random() < 0.5;
+    const q = room.sdQuestion;
+    const answerIndex = correct ? q.a : [0,1,2,3].filter(i => i !== q.a)[Math.floor(Math.random() * 3)];
+    handleSuddenDeathAnswer(room, player.index, answerIndex);
+  }, delay);
+}
+
+// Bot emotes during gameplay
+function startBotEmotes(room) {
+  clearInterval(room.botEmoteInterval);
+  room.botEmoteInterval = setInterval(() => {
+    if (room.phase !== 'playing') { clearInterval(room.botEmoteInterval); return; }
+    const bots = room.players.filter(p => p.isBot && !p.eliminated);
+    if (!bots.length) { clearInterval(room.botEmoteInterval); return; }
+    // ~20% chance every 4 seconds for a random bot
+    if (Math.random() < 0.20) {
+      const bot = bots[Math.floor(Math.random() * bots.length)];
+      const emoji = BOT_EMOTES[Math.floor(Math.random() * BOT_EMOTES.length)];
+      broadcast(room, { type: 'emote', playerIndex: bot.index, emoji });
+    }
+  }, 4000);
+}
+
+// Queue backfill timer — checks every 5 seconds
+let queueBackfillTimer = null;
+function startQueueBackfill() {
+  if (queueBackfillTimer) return;
+  queueBackfillTimer = setInterval(() => {
+    if (queue.length === 0) return;
+    // Check if any player has been waiting 30+ seconds
+    const now = Date.now();
+    const waitingLong = queue.some(p => p.joinedAt && (now - p.joinedAt) >= 30000);
+    if (waitingLong && queue.length < PLAYERS_PER_ROOM) {
+      const botsNeeded = PLAYERS_PER_ROOM - queue.length;
+      const botNames = getBotNames(botsNeeded);
+      botNames.forEach(name => {
+        const bot = createBot(name);
+        queue.push({ ws: null, name: bot.name, isBot: true, botData: bot });
+        console.log(`Bot ${name} added to queue (${queue.length}/${PLAYERS_PER_ROOM})`);
+      });
+      // Notify real players
+      queue.filter(p => p.ws).forEach(p => send(p.ws, {
+        type: 'queue_update',
+        count: queue.length,
+        needed: PLAYERS_PER_ROOM,
+      }));
+      // Check if we now have enough
+      if (queue.length >= PLAYERS_PER_ROOM) {
+        const roomPlayers = queue.splice(0, PLAYERS_PER_ROOM);
+        createRoom(roomPlayers);
+      }
+    }
+  }, 5000);
+}
+startQueueBackfill();
+
 // ── MATCHMAKING QUEUE ──
 
 function addToQueue(ws, name) {
@@ -541,7 +681,7 @@ function addToQueue(ws, name) {
   const existing = queue.findIndex(p => p.ws === ws);
   if (existing >= 0) queue.splice(existing, 1);
 
-  queue.push({ ws, name });
+  queue.push({ ws, name, joinedAt: Date.now() });
   console.log(`${name} joined queue (${queue.length}/${PLAYERS_PER_ROOM})`);
 
   // Notify everyone in queue about the current count

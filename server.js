@@ -403,10 +403,10 @@ function endRound(room) {
       setTimeout(() => endGame(room, sorted), 3000);
     }
   } else {
-    // Next round after delay
+    // Next round after delay — topics already picked, go straight to playing
     setTimeout(() => {
       room.round++;
-      startTopicSelection(room);
+      startRound(room);
     }, 5000);
   }
 }

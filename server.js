@@ -14,22 +14,22 @@
 // - The server processes the message and sends back responses
 // - When 5 players are queued, they get put into a "room" together
 // - The server controls the game flow and tells all players what's happening
-
+ 
 const { WebSocketServer } = require('ws');
 const http = require('http');
-
+ 
 // ── CONFIG ──
 const PORT = process.env.PORT || 3000;
 const PLAYERS_PER_ROOM = 5;
 const TIMER_SECS = 10;
 const TOPIC_TIMER_SECS = 10;
-
+ 
 // ── QUESTIONS DATABASE ──
 // Same questions as your frontend, but now the server owns them.
 // This prevents cheating — players never see the correct answer
 // until the server tells them.
 const QUESTIONS_DB = require('./questions.js');
-
+ 
 const TOPICS = [
   {id:'history',name:'History',icon:'🏛️',desc:'Events, figures, civilizations',color:'251,191,36'},
   {id:'geography',name:'Geography',icon:'🗺️',desc:'Countries, capitals, landmarks',color:'52,211,153'},
@@ -45,25 +45,26 @@ const TOPICS = [
   {id:'starwars',name:'Star Wars',icon:'🌌',desc:'Jedi, Sith, galaxy far away',color:'103,232,249'},
   {id:'lotr',name:'Lord of the Rings',icon:'💍',desc:'Middle-earth, hobbits, rings',color:'217,180,120'},
   {id:'got',name:'Game of Thrones',icon:'🐉',desc:'Westeros, houses, dragons',color:'239,68,68'},
-  {id:'breakingbad',name:'Breaking Bad',icon:'🧪',desc:'Heisenberg, meth, Albuquerque',color:'74,222,128'}
+  {id:'breakingbad',name:'Breaking Bad',icon:'🧪',desc:'Heisenberg, meth, Albuquerque',color:'74,222,128'},
+  {id:'pokemon',name:'Pokémon',icon:'⚡',desc:'Trainers, battles, Gotta catch em all',color:'250,204,21'}
 ];
-
+ 
 // ── STATE ──
 // These are the "live" data structures the server keeps in memory.
 // When the server restarts, these reset (we'll add a database later for persistence).
-
+ 
 const queue = [];          // Players waiting for a match
 const rooms = new Map();   // Active game rooms: roomId -> Room object
 const playerMap = new Map(); // WebSocket -> player info (for quick lookup)
-
+ 
 let nextRoomId = 1;
-
+ 
 // ── HELPER FUNCTIONS ──
-
+ 
 function generateId() {
   return 'room_' + (nextRoomId++);
 }
-
+ 
 function shuffle(arr) {
   const a = [...arr];
   for (let i = a.length - 1; i > 0; i--) {
@@ -72,28 +73,28 @@ function shuffle(arr) {
   }
   return a;
 }
-
+ 
 // Send a JSON message to one player (skip bots)
 function send(ws, data) {
   if (ws && ws.readyState === 1) {
     ws.send(JSON.stringify(data));
   }
 }
-
+ 
 // Send a JSON message to ALL players in a room
 function broadcast(room, data) {
   room.players.forEach(p => send(p.ws, data));
 }
-
+ 
 // Send a message to all players in a room EXCEPT one
 function broadcastExcept(room, exceptWs, data) {
   room.players.forEach(p => {
     if (p.ws !== exceptWs) send(p.ws, data);
   });
 }
-
+ 
 // ── ROOM / GAME LOGIC ──
-
+ 
 function createRoom(players) {
   const roomId = generateId();
   const room = {
@@ -128,9 +129,9 @@ function createRoom(players) {
     botEmoteInterval: null,
     phase: 'topic_selection',
   };
-
+ 
   rooms.set(roomId, room);
-
+ 
   // Tell each REAL player about the room and all other players
   room.players.forEach(p => {
     if (p.ws) {
@@ -143,17 +144,17 @@ function createRoom(players) {
       });
     }
   });
-
+ 
   // Start topic selection after a short delay
   setTimeout(() => startTopicSelection(room), 1500);
-
+ 
   console.log(`Room ${roomId} created with ${room.players.filter(p=>!p.isBot).length} real + ${room.players.filter(p=>p.isBot).length} bot players`);
   return room;
 }
-
+ 
 function startTopicSelection(room) {
   room.phase = 'topic_selection';
-
+ 
   // Give each player 3 random topic options
   room.players.forEach(p => {
     if (p.eliminated) return;
@@ -166,13 +167,13 @@ function startTopicSelection(room) {
       options: options.map(t => ({ id: t.id, name: t.name, icon: t.icon, desc: t.desc, color: t.color }))
     });
   });
-
+ 
   // Broadcast to everyone that topic selection started
   broadcast(room, { type: 'topic_phase_start', round: room.round });
-
+ 
   // Trigger bot topic picks
   room.players.filter(p => p.isBot && !p.eliminated).forEach(p => botPickTopic(room, p));
-
+ 
   // Start 10-second timer — auto-pick for anyone who hasn't chosen
   room.topicTimer = setTimeout(() => {
     const active = room.players.filter(p => !p.eliminated);
@@ -189,23 +190,23 @@ function startTopicSelection(room) {
     finishTopicSelection(room);
   }, TOPIC_TIMER_SECS * 1000);
 }
-
+ 
 function handleTopicPick(room, playerIndex, topicId) {
   const player = room.players[playerIndex];
   if (!player || player.eliminated || player.topicPick) return;
-
+ 
   const topic = player.topicOptions?.find(t => t.id === topicId);
   if (!topic) return;
-
+ 
   player.topicPick = topic;
-
+ 
   // Tell everyone this player picked
   broadcast(room, {
     type: 'player_picked_topic',
     playerIndex: player.index,
     topic: { id: topic.id, name: topic.name, icon: topic.icon }
   });
-
+ 
   // Check if all active players have picked
   const active = room.players.filter(p => !p.eliminated);
   if (active.every(p => p.topicPick)) {
@@ -213,7 +214,7 @@ function handleTopicPick(room, playerIndex, topicId) {
     setTimeout(() => finishTopicSelection(room), 1000);
   }
 }
-
+ 
 function finishTopicSelection(room) {
   // Collect unique topics from player picks, fill to 5 if needed
   const picked = [];
@@ -230,20 +231,20 @@ function finishTopicSelection(room) {
     else break;
   }
   room.topics = picked.slice(0, 5);
-
+ 
   broadcast(room, {
     type: 'topics_locked',
     topics: room.topics.map(t => ({ id: t.id, name: t.name, icon: t.icon, color: t.color }))
   });
-
+ 
   // Build questions and start the round
   setTimeout(() => startRound(room), 2000);
 }
-
+ 
 function startRound(room) {
   room.phase = 'playing';
   room.currentQ = 0;
-
+ 
   // Reset round stats for active players
   room.players.filter(p => !p.eliminated).forEach(p => {
     p.roundScore = 0;
@@ -252,7 +253,7 @@ function startRound(room) {
     p.roundTotalTime = 0;
     p.answered = false;
   });
-
+ 
   // Build 5 questions (one per topic), avoiding repeats from earlier rounds
   if (!room.usedQuestions) room.usedQuestions = {};
   room.questions = room.topics.map(topic => {
@@ -264,18 +265,18 @@ function startRound(room) {
     room.usedQuestions[topic.id].push(pool.indexOf(q));
     return { ...q, topicId: topic.id, topicName: topic.name, topicIcon: topic.icon };
   });
-
+ 
   broadcast(room, { type: 'round_start', round: room.round });
   setTimeout(() => sendQuestion(room), 500);
 }
-
+ 
 function sendQuestion(room) {
   const q = room.questions[room.currentQ];
   if (!q) return;
-
+ 
   room.players.filter(p => !p.eliminated).forEach(p => { p.answered = false; });
   room.acceptingAnswers = false; // Block answers during grace period
-
+ 
   // Send question to all players — but WITHOUT the correct answer!
   broadcast(room, {
     type: 'question',
@@ -287,15 +288,15 @@ function sendQuestion(room) {
     options: q.opts,
     // NOTE: we do NOT send q.a (correct answer) — that stays on the server
   });
-
+ 
   // 1-second grace period — let everyone read the question before timer starts
   setTimeout(() => {
     room.questionStartTime = Date.now();
     room.acceptingAnswers = true;
-
+ 
     // Tell clients to start their timers
     broadcast(room, { type: 'timer_start' });
-
+ 
     // Start question timer
     room.questionTimer = setTimeout(() => {
       // Time's up — score anyone who hasn't answered as wrong
@@ -304,36 +305,36 @@ function sendQuestion(room) {
       });
       revealAnswer(room);
     }, TIMER_SECS * 1000);
-
+ 
     // Trigger bot answers
     room.players.filter(p => p.isBot && !p.eliminated).forEach(p => botAnswerQuestion(room, p));
   }, 1000);
-
+ 
   // Start bot emotes if not already running
   if (!room.botEmoteInterval) startBotEmotes(room);
 }
-
+ 
 function handleAnswer(room, playerIndex, answerIndex) {
   const player = room.players[playerIndex];
   if (!player || player.eliminated || player.answered) return;
   if (room.phase !== 'playing') return;
   if (!room.acceptingAnswers) return; // Grace period still active
-
+ 
   player.answered = true;
   const q = room.questions[room.currentQ];
   const timeTaken = (Date.now() - room.questionStartTime) / 1000;
   const correct = answerIndex === q.a;
-
+ 
   // Calculate points — faster = more points
   const pts = correct ? Math.max(10, Math.round(((TIMER_SECS - timeTaken) / TIMER_SECS) * 90) + 10) : 0;
-
+ 
   player.roundScore += pts;
   player.roundTime += timeTaken;
   if (correct) {
     player.roundCorrect++;
     player.roundTotalTime += timeTaken;
   }
-
+ 
   // Tell this player their result
   send(player.ws, {
     type: 'answer_result',
@@ -342,7 +343,7 @@ function handleAnswer(room, playerIndex, answerIndex) {
     timeTaken: Math.round(timeTaken * 10) / 10,
     correctIndex: q.a,
   });
-
+ 
   // Tell everyone that this player answered (but not what they picked)
   broadcast(room, {
     type: 'player_answered',
@@ -350,7 +351,7 @@ function handleAnswer(room, playerIndex, answerIndex) {
     // We broadcast updated scores so the race board updates
     scores: getScoreboard(room),
   });
-
+ 
   // Check if all active players have answered
   const active = room.players.filter(p => !p.eliminated);
   if (active.every(p => p.answered)) {
@@ -358,17 +359,17 @@ function handleAnswer(room, playerIndex, answerIndex) {
     setTimeout(() => revealAnswer(room), 300);
   }
 }
-
+ 
 function revealAnswer(room) {
   const q = room.questions[room.currentQ];
-
+ 
   // Tell everyone the correct answer
   broadcast(room, {
     type: 'answer_reveal',
     correctIndex: q.a,
     scores: getScoreboard(room),
   });
-
+ 
   // Next question or end round
   setTimeout(() => {
     room.currentQ++;
@@ -379,7 +380,7 @@ function revealAnswer(room) {
     }
   }, 1600);
 }
-
+ 
 function getScoreboard(room) {
   return room.players
     .filter(p => !p.eliminated && !p.disconnected)
@@ -391,27 +392,27 @@ function getScoreboard(room) {
     }))
     .sort((a, b) => b.roundScore - a.roundScore);
 }
-
+ 
 function endRound(room) {
   room.phase = 'round_end';
-
+ 
   const active = room.players.filter(p => !p.eliminated);
   const sorted = [...active].sort((a, b) => {
     if (b.roundScore !== a.roundScore) return b.roundScore - a.roundScore;
     return a.roundTime - b.roundTime;
   });
-
+ 
   const isFinale = room.round === 3;
   let eliminatedPlayer = null;
-
+ 
   if (!isFinale) {
     eliminatedPlayer = sorted[sorted.length - 1];
     eliminatedPlayer.eliminated = true;
   }
-
+ 
   // Add round scores to total
   active.forEach(p => { p.score += p.roundScore; });
-
+ 
   // Send round results to everyone
   broadcast(room, {
     type: 'round_end',
@@ -427,7 +428,7 @@ function endRound(room) {
     })),
     eliminatedIndex: eliminatedPlayer ? eliminatedPlayer.index : null,
   });
-
+ 
   if (isFinale) {
     // Check for tie in finale
     if (sorted.length >= 2 && sorted[0].roundScore === sorted[1].roundScore) {
@@ -443,10 +444,10 @@ function endRound(room) {
     }, 5000);
   }
 }
-
+ 
 function startSuddenDeath(room, p1, p2) {
   room.phase = 'sudden_death';
-
+ 
   // Pick a random question
   const allTopicIds = Object.keys(QUESTIONS_DB);
   const tid = allTopicIds[Math.floor(Math.random() * allTopicIds.length)];
@@ -456,7 +457,7 @@ function startSuddenDeath(room, p1, p2) {
   room.sdPlayers = [p1, p2];
   room.sdAnswers = {};
   room.questionStartTime = Date.now();
-
+ 
   broadcast(room, {
     type: 'sudden_death',
     player1: { index: p1.index, name: p1.name },
@@ -464,36 +465,36 @@ function startSuddenDeath(room, p1, p2) {
     text: q.q,
     options: q.opts,
   });
-
+ 
   room.questionTimer = setTimeout(() => {
     // Time's up — whoever answered correctly first wins, or p1 by default
     resolveSuddenDeath(room);
   }, TIMER_SECS * 1000);
-
+ 
   // Trigger bot answers in sudden death
   [p1, p2].filter(p => p.isBot).forEach(p => botAnswerSuddenDeath(room, p));
 }
-
+ 
 function handleSuddenDeathAnswer(room, playerIndex, answerIndex) {
   if (room.sdAnswers[playerIndex] !== undefined) return;
-
+ 
   const timeTaken = (Date.now() - room.questionStartTime) / 1000;
   const correct = answerIndex === room.sdQuestion.a;
   room.sdAnswers[playerIndex] = { correct, time: timeTaken, answer: answerIndex };
-
+ 
   send(room.players[playerIndex].ws, {
     type: 'sd_answer_result',
     correct,
     correctIndex: room.sdQuestion.a,
   });
-
+ 
   // If this player got it right, they win immediately
   if (correct) {
     clearTimeout(room.questionTimer);
     setTimeout(() => resolveSuddenDeath(room), 1000);
     return;
   }
-
+ 
   // If both have answered, resolve
   const both = room.sdPlayers.every(p => room.sdAnswers[p.index] !== undefined);
   if (both) {
@@ -501,41 +502,41 @@ function handleSuddenDeathAnswer(room, playerIndex, answerIndex) {
     setTimeout(() => resolveSuddenDeath(room), 1000);
   }
 }
-
+ 
 function resolveSuddenDeath(room) {
   const [p1, p2] = room.sdPlayers;
   const a1 = room.sdAnswers[p1.index];
   const a2 = room.sdAnswers[p2.index];
-
+ 
   let winner, loser;
-
+ 
   // Determine winner: correct answer wins; if both correct, faster wins; if neither, faster wins
   if (a1?.correct && !a2?.correct) { winner = p1; loser = p2; }
   else if (a2?.correct && !a1?.correct) { winner = p2; loser = p1; }
   else if (a1?.correct && a2?.correct) { winner = a1.time <= a2.time ? p1 : p2; loser = winner === p1 ? p2 : p1; }
   else { winner = p1; loser = p2; } // fallback
-
+ 
   const active = room.players.filter(p => !p.eliminated);
   const sorted = [winner, loser, ...active.filter(p => p !== winner && p !== loser)];
-
+ 
   broadcast(room, {
     type: 'sudden_death_result',
     winnerIndex: winner.index,
     loserIndex: loser.index,
     correctIndex: room.sdQuestion.a,
   });
-
+ 
   setTimeout(() => endGame(room, sorted), 2000);
 }
-
+ 
 function endGame(room, sorted) {
   room.phase = 'finished';
   clearInterval(room.botEmoteInterval);
-
+ 
   // Include eliminated players for full final standings
   const eliminated = room.players.filter(p => p.eliminated).reverse();
   const fullStandings = [...sorted.filter(p => !p.eliminated), ...eliminated];
-
+ 
   broadcast(room, {
     type: 'game_over',
     standings: fullStandings.map((p, i) => ({
@@ -547,7 +548,7 @@ function endGame(room, sorted) {
     winnerIndex: sorted[0].index,
     winnerName: sorted[0].name,
   });
-
+ 
   // Clean up room after a delay
   setTimeout(() => {
     room.players.forEach(p => playerMap.delete(p.ws));
@@ -555,7 +556,7 @@ function endGame(room, sorted) {
     console.log(`Room ${room.id} cleaned up`);
   }, 10000);
 }
-
+ 
 // ── EMOTES ──
 function handleEmote(room, playerIndex, emoji) {
   // Broadcast to all other players in the room
@@ -565,11 +566,11 @@ function handleEmote(room, playerIndex, emoji) {
     emoji,
   });
 }
-
+ 
 // ── BOT SYSTEM ──
 const BOT_NAMES = ['Alex','Jordan','Sam','Riley','Morgan','Casey','Quinn','Avery','Blake','Drew','Skyler','Sage','Rowan','Harper','Reese','Dakota','Finley','Emery','Hayden','Logan'];
 const BOT_EMOTES = ['😂','😱','🤯','👏','💀','😤','🥶','👀'];
-
+ 
 function createBot(name) {
   return {
     ws: null,
@@ -587,14 +588,14 @@ function createBot(name) {
     botAccuracy: 0.55 + Math.random() * 0.15, // 55-70% per bot
   };
 }
-
+ 
 function getBotNames(count) {
   const shuffled = shuffle([...BOT_NAMES]);
   // Avoid names already in queue
   const taken = new Set(queue.map(p => p.name));
   return shuffled.filter(n => !taken.has(n)).slice(0, count);
 }
-
+ 
 // Bot auto-pick topic after random delay
 function botPickTopic(room, player) {
   if (!player.isBot || player.eliminated || player.topicPick) return;
@@ -605,7 +606,7 @@ function botPickTopic(room, player) {
     handleTopicPick(room, player.index, topic.id);
   }, delay);
 }
-
+ 
 // Bot auto-answer question after random delay
 function botAnswerQuestion(room, player) {
   if (!player.isBot || player.eliminated || player.answered) return;
@@ -621,7 +622,7 @@ function botAnswerQuestion(room, player) {
   // Store timeout so we can clear on disconnect
   player._botAnswerTimeout = timeout;
 }
-
+ 
 // Bot auto-answer sudden death
 function botAnswerSuddenDeath(room, player) {
   if (!player.isBot) return;
@@ -634,7 +635,7 @@ function botAnswerSuddenDeath(room, player) {
     handleSuddenDeathAnswer(room, player.index, answerIndex);
   }, delay);
 }
-
+ 
 // Bot emotes during gameplay
 function startBotEmotes(room) {
   clearInterval(room.botEmoteInterval);
@@ -650,7 +651,7 @@ function startBotEmotes(room) {
     }
   }, 4000);
 }
-
+ 
 // Queue backfill timer — checks every 5 seconds
 let queueBackfillTimer = null;
 function startQueueBackfill() {
@@ -683,31 +684,31 @@ function startQueueBackfill() {
   }, 5000);
 }
 startQueueBackfill();
-
+ 
 // ── MATCHMAKING QUEUE ──
-
+ 
 function addToQueue(ws, name) {
   // Remove if already in queue
   const existing = queue.findIndex(p => p.ws === ws);
   if (existing >= 0) queue.splice(existing, 1);
-
+ 
   queue.push({ ws, name, joinedAt: Date.now() });
   console.log(`${name} joined queue (${queue.length}/${PLAYERS_PER_ROOM})`);
-
+ 
   // Notify everyone in queue about the current count
   queue.forEach(p => send(p.ws, {
     type: 'queue_update',
     count: queue.length,
     needed: PLAYERS_PER_ROOM,
   }));
-
+ 
   // Check if we have enough players
   if (queue.length >= PLAYERS_PER_ROOM) {
     const roomPlayers = queue.splice(0, PLAYERS_PER_ROOM);
     createRoom(roomPlayers);
   }
 }
-
+ 
 function removeFromQueue(ws) {
   const idx = queue.findIndex(p => p.ws === ws);
   if (idx >= 0) {
@@ -721,9 +722,9 @@ function removeFromQueue(ws) {
     }));
   }
 }
-
+ 
 // ── WEBSOCKET SERVER ──
-
+ 
 const server = http.createServer((req, res) => {
   // Simple health check endpoint
   if (req.url === '/health') {
@@ -736,7 +737,7 @@ const server = http.createServer((req, res) => {
     }));
     return;
   }
-
+ 
   // Serve a simple status page
   res.writeHead(200, { 'Content-Type': 'text/html' });
   res.end(`
@@ -746,28 +747,28 @@ const server = http.createServer((req, res) => {
     <p>Connected players: ${playerMap.size}</p>
   `);
 });
-
+ 
 const wss = new WebSocketServer({ server });
-
+ 
 wss.on('connection', (ws) => {
   console.log('New connection');
-
+ 
   ws.on('message', (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
-
+ 
     switch (msg.type) {
-
+ 
       case 'join_queue':
         // Player wants to find a match
         if (!msg.name || msg.name.length > 16) return;
         addToQueue(ws, msg.name.trim());
         break;
-
+ 
       case 'leave_queue':
         removeFromQueue(ws);
         break;
-
+ 
       case 'pick_topic':
         // Player picked a topic during selection phase
         const info1 = playerMap.get(ws);
@@ -776,7 +777,7 @@ wss.on('connection', (ws) => {
         if (!room1) return;
         handleTopicPick(room1, info1.playerIndex, msg.topicId);
         break;
-
+ 
       case 'answer':
         // Player answered a question
         const info2 = playerMap.get(ws);
@@ -789,7 +790,7 @@ wss.on('connection', (ws) => {
           handleAnswer(room2, info2.playerIndex, msg.answerIndex);
         }
         break;
-
+ 
       case 'emote':
         // Player sent an emote
         const info3 = playerMap.get(ws);
@@ -800,11 +801,11 @@ wss.on('connection', (ws) => {
         break;
     }
   });
-
+ 
   ws.on('close', () => {
     console.log('Connection closed');
     removeFromQueue(ws);
-
+ 
     // If player was in a room, handle disconnect
     const info = playerMap.get(ws);
     if (info) {
@@ -821,9 +822,9 @@ wss.on('connection', (ws) => {
             playerIndex: info.playerIndex,
             name: player.name,
           });
-
+ 
           console.log(`${player.name} disconnected from room ${room.id}`);
-
+ 
           // Check if enough players remain
           const remaining = room.players.filter(p => !p.eliminated);
           
@@ -852,7 +853,7 @@ wss.on('connection', (ws) => {
             }, 5000);
             return;
           }
-
+ 
           // If in playing phase, check if all remaining players have answered
           if (room.phase === 'playing') {
             const active = room.players.filter(p => !p.eliminated);
@@ -861,7 +862,7 @@ wss.on('connection', (ws) => {
               setTimeout(() => revealAnswer(room), 300);
             }
           }
-
+ 
           // If in topic_selection phase, check if all remaining players have picked
           if (room.phase === 'topic_selection') {
             const active = room.players.filter(p => !p.eliminated);
@@ -870,7 +871,7 @@ wss.on('connection', (ws) => {
               setTimeout(() => finishTopicSelection(room), 500);
             }
           }
-
+ 
           // If in sudden_death phase, resolve it
           if (room.phase === 'sudden_death' && room.sdPlayers) {
             const sdOpponent = room.sdPlayers.find(p => p !== player);
@@ -889,7 +890,7 @@ wss.on('connection', (ws) => {
     }
   });
 });
-
+ 
 server.listen(PORT, () => {
   console.log(`Mindbrawl server running on port ${PORT}`);
   console.log(`Health check: http://localhost:${PORT}/health`);

@@ -1,897 +1,869 @@
-// ============================================
-// BRAINBATTLE MULTIPLAYER SERVER
-// ============================================
-// This is the brain of your online game.
-// It handles:
-//   1. Players connecting via WebSocket
-//   2. Matchmaking queue (grouping 5 players)
-//   3. Game rooms (topic selection, questions, scoring)
-//   4. Broadcasting game state to all players in a room
-//
-// HOW IT WORKS:
-// - A player's browser opens a WebSocket connection to this server
-// - The player sends JSON messages like { type: 'join_queue', name: 'Alex' }
-// - The server processes the message and sends back responses
-// - When 5 players are queued, they get put into a "room" together
-// - The server controls the game flow and tells all players what's happening
- 
-const { WebSocketServer } = require('ws');
-const http = require('http');
- 
-// ── CONFIG ──
-const PORT = process.env.PORT || 3000;
-const PLAYERS_PER_ROOM = 5;
-const TIMER_SECS = 10;
-const TOPIC_TIMER_SECS = 10;
- 
-// ── QUESTIONS DATABASE ──
-// Same questions as your frontend, but now the server owns them.
-// This prevents cheating — players never see the correct answer
-// until the server tells them.
-const QUESTIONS_DB = require('./questions.js');
- 
-const TOPICS = [
-  {id:'history',name:'History',icon:'🏛️',desc:'Events, figures, civilizations',color:'251,191,36'},
-  {id:'geography',name:'Geography',icon:'🗺️',desc:'Countries, capitals, landmarks',color:'52,211,153'},
-  {id:'movies',name:'Movies & TV',icon:'🎬',desc:'Cinema, streaming, pop culture',color:'251,113,133'},
-  {id:'sports',name:'Sports',icon:'⚽',desc:'Teams, athletes, records',color:'34,211,238'},
-  {id:'music',name:'Music',icon:'🎵',desc:'Artists, albums, genres',color:'192,132,252'},
-  {id:'tech',name:'Technology',icon:'💻',desc:'Gadgets, software, internet',color:'96,165,250'},
-  {id:'space',name:'Space',icon:'🚀',desc:'Planets, stars, missions',color:'199,210,254'},
-  {id:'anime',name:'Anime & Manga',icon:'🎌',desc:'Shonen, heroes, studios',color:'244,114,182'},
-  {id:'games',name:'Video Games',icon:'🎮',desc:'Consoles, titles, characters',color:'163,230,53'},
-  {id:'mythology',name:'Mythology',icon:'⚡',desc:'Gods, legends, folklore',color:'253,164,75'},
-  {id:'harrypotter',name:'Harry Potter',icon:'🧙',desc:'Wizards, spells, Hogwarts',color:'139,92,246'},
-  {id:'starwars',name:'Star Wars',icon:'🌌',desc:'Jedi, Sith, galaxy far away',color:'103,232,249'},
-  {id:'lotr',name:'Lord of the Rings',icon:'💍',desc:'Middle-earth, hobbits, rings',color:'217,180,120'},
-  {id:'got',name:'Game of Thrones',icon:'🐉',desc:'Westeros, houses, dragons',color:'239,68,68'},
-  {id:'breakingbad',name:'Breaking Bad',icon:'🧪',desc:'Heisenberg, meth, Albuquerque',color:'74,222,128'},
-  {id:'pokemon',name:'Pokémon',icon:'⚡',desc:'Trainers, battles, Gotta catch em all',color:'250,204,21'}
-];
- 
-// ── STATE ──
-// These are the "live" data structures the server keeps in memory.
-// When the server restarts, these reset (we'll add a database later for persistence).
- 
-const queue = [];          // Players waiting for a match
-const rooms = new Map();   // Active game rooms: roomId -> Room object
-const playerMap = new Map(); // WebSocket -> player info (for quick lookup)
- 
-let nextRoomId = 1;
- 
-// ── HELPER FUNCTIONS ──
- 
-function generateId() {
-  return 'room_' + (nextRoomId++);
-}
- 
-function shuffle(arr) {
-  const a = [...arr];
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-  return a;
-}
- 
-// Send a JSON message to one player (skip bots)
-function send(ws, data) {
-  if (ws && ws.readyState === 1) {
-    ws.send(JSON.stringify(data));
-  }
-}
- 
-// Send a JSON message to ALL players in a room
-function broadcast(room, data) {
-  room.players.forEach(p => send(p.ws, data));
-}
- 
-// Send a message to all players in a room EXCEPT one
-function broadcastExcept(room, exceptWs, data) {
-  room.players.forEach(p => {
-    if (p.ws !== exceptWs) send(p.ws, data);
-  });
-}
- 
-// ── ROOM / GAME LOGIC ──
- 
-function createRoom(players) {
-  const roomId = generateId();
-  const room = {
-    id: roomId,
-    players: players.map((p, i) => {
-      if (p.isBot && p.botData) {
-        // Bot player
-        return { ...p.botData, index: i };
-      }
-      return {
-        ws: p.ws,
-        name: p.name,
-        index: i,
-        score: 0,
-        roundScore: 0,
-        roundCorrect: 0,
-        roundTime: 0,
-        roundTotalTime: 0,
-        eliminated: false,
-        topicPick: null,
-        answered: false,
-        answerTime: 0,
-      };
-    }),
-    round: 1,
-    currentQ: 0,
-    topics: [],
-    questions: [],
-    questionStartTime: null,
-    topicTimer: null,
-    questionTimer: null,
-    botEmoteInterval: null,
-    phase: 'topic_selection',
-  };
- 
-  rooms.set(roomId, room);
- 
-  // Tell each REAL player about the room and all other players
-  room.players.forEach(p => {
-    if (p.ws) {
-      playerMap.set(p.ws, { roomId, playerIndex: p.index });
-      send(p.ws, {
-        type: 'match_found',
-        roomId,
-        yourIndex: p.index,
-        players: room.players.map(pl => ({ name: pl.name, index: pl.index }))
-      });
-    }
-  });
- 
-  // Start topic selection after a short delay
-  setTimeout(() => startTopicSelection(room), 1500);
- 
-  console.log(`Room ${roomId} created with ${room.players.filter(p=>!p.isBot).length} real + ${room.players.filter(p=>p.isBot).length} bot players`);
-  return room;
-}
- 
-function startTopicSelection(room) {
-  room.phase = 'topic_selection';
- 
-  // Give each player 3 random topic options
-  room.players.forEach(p => {
-    if (p.eliminated) return;
-    const options = shuffle(TOPICS).slice(0, 3);
-    p.topicOptions = options;
-    p.topicPick = null;
-    send(p.ws, {
-      type: 'topic_selection',
-      round: room.round,
-      options: options.map(t => ({ id: t.id, name: t.name, icon: t.icon, desc: t.desc, color: t.color }))
-    });
-  });
- 
-  // Broadcast to everyone that topic selection started
-  broadcast(room, { type: 'topic_phase_start', round: room.round });
- 
-  // Trigger bot topic picks
-  room.players.filter(p => p.isBot && !p.eliminated).forEach(p => botPickTopic(room, p));
- 
-  // Start 10-second timer — auto-pick for anyone who hasn't chosen
-  room.topicTimer = setTimeout(() => {
-    const active = room.players.filter(p => !p.eliminated);
-    active.forEach(p => {
-      if (!p.topicPick && p.topicOptions) {
-        p.topicPick = p.topicOptions[Math.floor(Math.random() * p.topicOptions.length)];
-        broadcast(room, {
-          type: 'player_picked_topic',
-          playerIndex: p.index,
-          topic: { id: p.topicPick.id, name: p.topicPick.name, icon: p.topicPick.icon }
-        });
-      }
-    });
-    finishTopicSelection(room);
-  }, TOPIC_TIMER_SECS * 1000);
-}
- 
-function handleTopicPick(room, playerIndex, topicId) {
-  const player = room.players[playerIndex];
-  if (!player || player.eliminated || player.topicPick) return;
- 
-  const topic = player.topicOptions?.find(t => t.id === topicId);
-  if (!topic) return;
- 
-  player.topicPick = topic;
- 
-  // Tell everyone this player picked
-  broadcast(room, {
-    type: 'player_picked_topic',
-    playerIndex: player.index,
-    topic: { id: topic.id, name: topic.name, icon: topic.icon }
-  });
- 
-  // Check if all active players have picked
-  const active = room.players.filter(p => !p.eliminated);
-  if (active.every(p => p.topicPick)) {
-    clearTimeout(room.topicTimer);
-    setTimeout(() => finishTopicSelection(room), 1000);
-  }
-}
- 
-function finishTopicSelection(room) {
-  // Collect unique topics from player picks, fill to 5 if needed
-  const picked = [];
-  const seen = new Set();
-  room.players.filter(p => !p.eliminated && p.topicPick).forEach(p => {
-    if (!seen.has(p.topicPick.id)) {
-      seen.add(p.topicPick.id);
-      picked.push(p.topicPick);
-    }
-  });
-  while (picked.length < 5) {
-    const t = TOPICS.find(t => !seen.has(t.id));
-    if (t) { seen.add(t.id); picked.push(t); }
-    else break;
-  }
-  room.topics = picked.slice(0, 5);
- 
-  broadcast(room, {
-    type: 'topics_locked',
-    topics: room.topics.map(t => ({ id: t.id, name: t.name, icon: t.icon, color: t.color }))
-  });
- 
-  // Build questions and start the round
-  setTimeout(() => startRound(room), 2000);
-}
- 
-function startRound(room) {
-  room.phase = 'playing';
-  room.currentQ = 0;
- 
-  // Reset round stats for active players
-  room.players.filter(p => !p.eliminated).forEach(p => {
-    p.roundScore = 0;
-    p.roundCorrect = 0;
-    p.roundTime = 0;
-    p.roundTotalTime = 0;
-    p.answered = false;
-  });
- 
-  // Build 5 questions (one per topic), avoiding repeats from earlier rounds
-  if (!room.usedQuestions) room.usedQuestions = {};
-  room.questions = room.topics.map(topic => {
-    const pool = QUESTIONS_DB[topic.id] || [];
-    if (!room.usedQuestions[topic.id]) room.usedQuestions[topic.id] = [];
-    const available = pool.filter((_, i) => !room.usedQuestions[topic.id].includes(i));
-    const src = available.length ? available : pool;
-    const q = src[Math.floor(Math.random() * src.length)];
-    room.usedQuestions[topic.id].push(pool.indexOf(q));
-    return { ...q, topicId: topic.id, topicName: topic.name, topicIcon: topic.icon };
-  });
- 
-  broadcast(room, { type: 'round_start', round: room.round });
-  setTimeout(() => sendQuestion(room), 500);
-}
- 
-function sendQuestion(room) {
-  const q = room.questions[room.currentQ];
-  if (!q) return;
- 
-  room.players.filter(p => !p.eliminated).forEach(p => { p.answered = false; });
-  room.acceptingAnswers = false; // Block answers during grace period
- 
-  // Send question to all players — but WITHOUT the correct answer!
-  broadcast(room, {
-    type: 'question',
-    questionIndex: room.currentQ,
-    topic: q.topicName,
-    topicIcon: q.topicIcon,
-    topicId: q.topicId,
-    text: q.q,
-    options: q.opts,
-    // NOTE: we do NOT send q.a (correct answer) — that stays on the server
-  });
- 
-  // 1-second grace period — let everyone read the question before timer starts
-  setTimeout(() => {
-    room.questionStartTime = Date.now();
-    room.acceptingAnswers = true;
- 
-    // Tell clients to start their timers
-    broadcast(room, { type: 'timer_start' });
- 
-    // Start question timer
-    room.questionTimer = setTimeout(() => {
-      // Time's up — score anyone who hasn't answered as wrong
-      room.players.filter(p => !p.eliminated && !p.answered).forEach(p => {
-        p.answered = true;
-      });
-      revealAnswer(room);
-    }, TIMER_SECS * 1000);
- 
-    // Trigger bot answers
-    room.players.filter(p => p.isBot && !p.eliminated).forEach(p => botAnswerQuestion(room, p));
-  }, 1000);
- 
-  // Start bot emotes if not already running
-  if (!room.botEmoteInterval) startBotEmotes(room);
-}
- 
-function handleAnswer(room, playerIndex, answerIndex) {
-  const player = room.players[playerIndex];
-  if (!player || player.eliminated || player.answered) return;
-  if (room.phase !== 'playing') return;
-  if (!room.acceptingAnswers) return; // Grace period still active
- 
-  player.answered = true;
-  const q = room.questions[room.currentQ];
-  const timeTaken = (Date.now() - room.questionStartTime) / 1000;
-  const correct = answerIndex === q.a;
- 
-  // Calculate points — faster = more points
-  const pts = correct ? Math.max(10, Math.round(((TIMER_SECS - timeTaken) / TIMER_SECS) * 90) + 10) : 0;
- 
-  player.roundScore += pts;
-  player.roundTime += timeTaken;
-  if (correct) {
-    player.roundCorrect++;
-    player.roundTotalTime += timeTaken;
-  }
- 
-  // Tell this player their result
-  send(player.ws, {
-    type: 'answer_result',
-    correct,
-    points: pts,
-    timeTaken: Math.round(timeTaken * 10) / 10,
-    correctIndex: q.a,
-  });
- 
-  // Tell everyone that this player answered (but not what they picked)
-  broadcast(room, {
-    type: 'player_answered',
-    playerIndex: player.index,
-    // We broadcast updated scores so the race board updates
-    scores: getScoreboard(room),
-  });
- 
-  // Check if all active players have answered
-  const active = room.players.filter(p => !p.eliminated);
-  if (active.every(p => p.answered)) {
-    clearTimeout(room.questionTimer);
-    setTimeout(() => revealAnswer(room), 300);
-  }
-}
- 
-function revealAnswer(room) {
-  const q = room.questions[room.currentQ];
- 
-  // Tell everyone the correct answer
-  broadcast(room, {
-    type: 'answer_reveal',
-    correctIndex: q.a,
-    scores: getScoreboard(room),
-  });
- 
-  // Next question or end round
-  setTimeout(() => {
-    room.currentQ++;
-    if (room.currentQ >= 5) {
-      endRound(room);
-    } else {
-      sendQuestion(room);
-    }
-  }, 1600);
-}
- 
-function getScoreboard(room) {
-  return room.players
-    .filter(p => !p.eliminated && !p.disconnected)
-    .map(p => ({
-      index: p.index,
-      name: p.name,
-      roundScore: p.roundScore,
-      answered: p.answered,
-    }))
-    .sort((a, b) => b.roundScore - a.roundScore);
-}
- 
-function endRound(room) {
-  room.phase = 'round_end';
- 
-  const active = room.players.filter(p => !p.eliminated);
-  const sorted = [...active].sort((a, b) => {
-    if (b.roundScore !== a.roundScore) return b.roundScore - a.roundScore;
-    return a.roundTime - b.roundTime;
-  });
- 
-  const isFinale = room.round === 3;
-  let eliminatedPlayer = null;
- 
-  if (!isFinale) {
-    eliminatedPlayer = sorted[sorted.length - 1];
-    eliminatedPlayer.eliminated = true;
-  }
- 
-  // Add round scores to total
-  active.forEach(p => { p.score += p.roundScore; });
- 
-  // Send round results to everyone
-  broadcast(room, {
-    type: 'round_end',
-    round: room.round,
-    isFinale,
-    results: sorted.map((p, i) => ({
-      index: p.index,
-      name: p.name,
-      roundScore: p.roundScore,
-      totalScore: p.score,
-      rank: i + 1,
-      eliminated: !isFinale && p === eliminatedPlayer,
-    })),
-    eliminatedIndex: eliminatedPlayer ? eliminatedPlayer.index : null,
-  });
- 
-  if (isFinale) {
-    // Check for tie in finale
-    if (sorted.length >= 2 && sorted[0].roundScore === sorted[1].roundScore) {
-      setTimeout(() => startSuddenDeath(room, sorted[0], sorted[1]), 3000);
-    } else {
-      setTimeout(() => endGame(room, sorted), 3000);
-    }
-  } else {
-    // Next round after delay — topics already picked, go straight to playing
-    setTimeout(() => {
-      room.round++;
-      startRound(room);
-    }, 5000);
-  }
-}
- 
-function startSuddenDeath(room, p1, p2) {
-  room.phase = 'sudden_death';
- 
-  // Pick a random question
-  const allTopicIds = Object.keys(QUESTIONS_DB);
-  const tid = allTopicIds[Math.floor(Math.random() * allTopicIds.length)];
-  const pool = QUESTIONS_DB[tid];
-  const q = pool[Math.floor(Math.random() * pool.length)];
-  room.sdQuestion = q;
-  room.sdPlayers = [p1, p2];
-  room.sdAnswers = {};
-  room.questionStartTime = Date.now();
- 
-  broadcast(room, {
-    type: 'sudden_death',
-    player1: { index: p1.index, name: p1.name },
-    player2: { index: p2.index, name: p2.name },
-    text: q.q,
-    options: q.opts,
-  });
- 
-  room.questionTimer = setTimeout(() => {
-    // Time's up — whoever answered correctly first wins, or p1 by default
-    resolveSuddenDeath(room);
-  }, TIMER_SECS * 1000);
- 
-  // Trigger bot answers in sudden death
-  [p1, p2].filter(p => p.isBot).forEach(p => botAnswerSuddenDeath(room, p));
-}
- 
-function handleSuddenDeathAnswer(room, playerIndex, answerIndex) {
-  if (room.sdAnswers[playerIndex] !== undefined) return;
- 
-  const timeTaken = (Date.now() - room.questionStartTime) / 1000;
-  const correct = answerIndex === room.sdQuestion.a;
-  room.sdAnswers[playerIndex] = { correct, time: timeTaken, answer: answerIndex };
- 
-  send(room.players[playerIndex].ws, {
-    type: 'sd_answer_result',
-    correct,
-    correctIndex: room.sdQuestion.a,
-  });
- 
-  // If this player got it right, they win immediately
-  if (correct) {
-    clearTimeout(room.questionTimer);
-    setTimeout(() => resolveSuddenDeath(room), 1000);
-    return;
-  }
- 
-  // If both have answered, resolve
-  const both = room.sdPlayers.every(p => room.sdAnswers[p.index] !== undefined);
-  if (both) {
-    clearTimeout(room.questionTimer);
-    setTimeout(() => resolveSuddenDeath(room), 1000);
-  }
-}
- 
-function resolveSuddenDeath(room) {
-  const [p1, p2] = room.sdPlayers;
-  const a1 = room.sdAnswers[p1.index];
-  const a2 = room.sdAnswers[p2.index];
- 
-  let winner, loser;
- 
-  // Determine winner: correct answer wins; if both correct, faster wins; if neither, faster wins
-  if (a1?.correct && !a2?.correct) { winner = p1; loser = p2; }
-  else if (a2?.correct && !a1?.correct) { winner = p2; loser = p1; }
-  else if (a1?.correct && a2?.correct) { winner = a1.time <= a2.time ? p1 : p2; loser = winner === p1 ? p2 : p1; }
-  else { winner = p1; loser = p2; } // fallback
- 
-  const active = room.players.filter(p => !p.eliminated);
-  const sorted = [winner, loser, ...active.filter(p => p !== winner && p !== loser)];
- 
-  broadcast(room, {
-    type: 'sudden_death_result',
-    winnerIndex: winner.index,
-    loserIndex: loser.index,
-    correctIndex: room.sdQuestion.a,
-  });
- 
-  setTimeout(() => endGame(room, sorted), 2000);
-}
- 
-function endGame(room, sorted) {
-  room.phase = 'finished';
-  clearInterval(room.botEmoteInterval);
- 
-  // Include eliminated players for full final standings
-  const eliminated = room.players.filter(p => p.eliminated).reverse();
-  const fullStandings = [...sorted.filter(p => !p.eliminated), ...eliminated];
- 
-  broadcast(room, {
-    type: 'game_over',
-    standings: fullStandings.map((p, i) => ({
-      index: p.index,
-      name: p.name,
-      totalScore: p.score,
-      place: i + 1,
-    })),
-    winnerIndex: sorted[0].index,
-    winnerName: sorted[0].name,
-  });
- 
-  // Clean up room after a delay
-  setTimeout(() => {
-    room.players.forEach(p => playerMap.delete(p.ws));
-    rooms.delete(room.id);
-    console.log(`Room ${room.id} cleaned up`);
-  }, 10000);
-}
- 
-// ── EMOTES ──
-function handleEmote(room, playerIndex, emoji) {
-  // Broadcast to all other players in the room
-  broadcastExcept(room, room.players[playerIndex]?.ws, {
-    type: 'emote',
-    playerIndex,
-    emoji,
-  });
-}
- 
-// ── BOT SYSTEM ──
-const BOT_NAMES = ['Alex','Jordan','Sam','Riley','Morgan','Casey','Quinn','Avery','Blake','Drew','Skyler','Sage','Rowan','Harper','Reese','Dakota','Finley','Emery','Hayden','Logan'];
-const BOT_EMOTES = ['😂','😱','🤯','👏','💀','😤','🥶','👀'];
- 
-function createBot(name) {
-  return {
-    ws: null,
-    name: name,
-    isBot: true,
-    score: 0,
-    roundScore: 0,
-    roundCorrect: 0,
-    roundTime: 0,
-    roundTotalTime: 0,
-    eliminated: false,
-    topicPick: null,
-    answered: false,
-    answerTime: 0,
-    botAccuracy: 0.55 + Math.random() * 0.15, // 55-70% per bot
-  };
-}
- 
-function getBotNames(count) {
-  const shuffled = shuffle([...BOT_NAMES]);
-  // Avoid names already in queue
-  const taken = new Set(queue.map(p => p.name));
-  return shuffled.filter(n => !taken.has(n)).slice(0, count);
-}
- 
-// Bot auto-pick topic after random delay
-function botPickTopic(room, player) {
-  if (!player.isBot || player.eliminated || player.topicPick) return;
-  const delay = 1500 + Math.random() * 4000;
-  setTimeout(() => {
-    if (player.topicPick || room.phase !== 'topic_selection') return;
-    const topic = player.topicOptions[Math.floor(Math.random() * player.topicOptions.length)];
-    handleTopicPick(room, player.index, topic.id);
-  }, delay);
-}
- 
-// Bot auto-answer question after random delay
-function botAnswerQuestion(room, player) {
-  if (!player.isBot || player.eliminated || player.answered) return;
-  const delay = 2000 + Math.random() * 5000; // 2-7 seconds
-  const timeout = setTimeout(() => {
-    if (player.answered || room.phase !== 'playing') return;
-    const q = room.questions[room.currentQ];
-    if (!q) return;
-    const correct = Math.random() < player.botAccuracy;
-    const answerIndex = correct ? q.a : [0,1,2,3].filter(i => i !== q.a)[Math.floor(Math.random() * 3)];
-    handleAnswer(room, player.index, answerIndex);
-  }, delay);
-  // Store timeout so we can clear on disconnect
-  player._botAnswerTimeout = timeout;
-}
- 
-// Bot auto-answer sudden death
-function botAnswerSuddenDeath(room, player) {
-  if (!player.isBot) return;
-  const delay = 2000 + Math.random() * 5000;
-  setTimeout(() => {
-    if (room.sdAnswers[player.index] !== undefined || room.phase !== 'sudden_death') return;
-    const correct = Math.random() < 0.5;
-    const q = room.sdQuestion;
-    const answerIndex = correct ? q.a : [0,1,2,3].filter(i => i !== q.a)[Math.floor(Math.random() * 3)];
-    handleSuddenDeathAnswer(room, player.index, answerIndex);
-  }, delay);
-}
- 
-// Bot emotes during gameplay
-function startBotEmotes(room) {
-  clearInterval(room.botEmoteInterval);
-  room.botEmoteInterval = setInterval(() => {
-    if (room.phase !== 'playing') { clearInterval(room.botEmoteInterval); return; }
-    const bots = room.players.filter(p => p.isBot && !p.eliminated);
-    if (!bots.length) { clearInterval(room.botEmoteInterval); return; }
-    // ~20% chance every 4 seconds for a random bot
-    if (Math.random() < 0.20) {
-      const bot = bots[Math.floor(Math.random() * bots.length)];
-      const emoji = BOT_EMOTES[Math.floor(Math.random() * BOT_EMOTES.length)];
-      broadcast(room, { type: 'emote', playerIndex: bot.index, emoji });
-    }
-  }, 4000);
-}
- 
-// Queue backfill timer — checks every 5 seconds
-let queueBackfillTimer = null;
-function startQueueBackfill() {
-  if (queueBackfillTimer) return;
-  queueBackfillTimer = setInterval(() => {
-    if (queue.length === 0) return;
-    // Check if any player has been waiting 30+ seconds
-    const now = Date.now();
-    const waitingLong = queue.some(p => p.joinedAt && (now - p.joinedAt) >= 30000);
-    if (waitingLong && queue.length < PLAYERS_PER_ROOM) {
-      const botsNeeded = PLAYERS_PER_ROOM - queue.length;
-      const botNames = getBotNames(botsNeeded);
-      botNames.forEach(name => {
-        const bot = createBot(name);
-        queue.push({ ws: null, name: bot.name, isBot: true, botData: bot });
-        console.log(`Bot ${name} added to queue (${queue.length}/${PLAYERS_PER_ROOM})`);
-      });
-      // Notify real players
-      queue.filter(p => p.ws).forEach(p => send(p.ws, {
-        type: 'queue_update',
-        count: queue.length,
-        needed: PLAYERS_PER_ROOM,
-      }));
-      // Check if we now have enough
-      if (queue.length >= PLAYERS_PER_ROOM) {
-        const roomPlayers = queue.splice(0, PLAYERS_PER_ROOM);
-        createRoom(roomPlayers);
-      }
-    }
-  }, 5000);
-}
-startQueueBackfill();
- 
-// ── MATCHMAKING QUEUE ──
- 
-function addToQueue(ws, name) {
-  // Remove if already in queue
-  const existing = queue.findIndex(p => p.ws === ws);
-  if (existing >= 0) queue.splice(existing, 1);
- 
-  queue.push({ ws, name, joinedAt: Date.now() });
-  console.log(`${name} joined queue (${queue.length}/${PLAYERS_PER_ROOM})`);
- 
-  // Notify everyone in queue about the current count
-  queue.forEach(p => send(p.ws, {
-    type: 'queue_update',
-    count: queue.length,
-    needed: PLAYERS_PER_ROOM,
-  }));
- 
-  // Check if we have enough players
-  if (queue.length >= PLAYERS_PER_ROOM) {
-    const roomPlayers = queue.splice(0, PLAYERS_PER_ROOM);
-    createRoom(roomPlayers);
-  }
-}
- 
-function removeFromQueue(ws) {
-  const idx = queue.findIndex(p => p.ws === ws);
-  if (idx >= 0) {
-    console.log(`${queue[idx].name} left queue`);
-    queue.splice(idx, 1);
-    // Update remaining queue members
-    queue.forEach(p => send(p.ws, {
-      type: 'queue_update',
-      count: queue.length,
-      needed: PLAYERS_PER_ROOM,
-    }));
-  }
-}
- 
-// ── WEBSOCKET SERVER ──
- 
-const server = http.createServer((req, res) => {
-  // Simple health check endpoint
-  if (req.url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      status: 'ok',
-      queue: queue.length,
-      rooms: rooms.size,
-      players: playerMap.size,
-    }));
-    return;
-  }
- 
-  // Serve a simple status page
-  res.writeHead(200, { 'Content-Type': 'text/html' });
-  res.end(`
-    <h1>Mindbrawl Server</h1>
-    <p>Queue: ${queue.length} players</p>
-    <p>Active rooms: ${rooms.size}</p>
-    <p>Connected players: ${playerMap.size}</p>
-  `);
-});
- 
-const wss = new WebSocketServer({ server });
- 
-wss.on('connection', (ws) => {
-  console.log('New connection');
- 
-  ws.on('message', (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw); } catch { return; }
- 
-    switch (msg.type) {
- 
-      case 'join_queue':
-        // Player wants to find a match
-        if (!msg.name || msg.name.length > 16) return;
-        addToQueue(ws, msg.name.trim());
-        break;
- 
-      case 'leave_queue':
-        removeFromQueue(ws);
-        break;
- 
-      case 'pick_topic':
-        // Player picked a topic during selection phase
-        const info1 = playerMap.get(ws);
-        if (!info1) return;
-        const room1 = rooms.get(info1.roomId);
-        if (!room1) return;
-        handleTopicPick(room1, info1.playerIndex, msg.topicId);
-        break;
- 
-      case 'answer':
-        // Player answered a question
-        const info2 = playerMap.get(ws);
-        if (!info2) return;
-        const room2 = rooms.get(info2.roomId);
-        if (!room2) return;
-        if (room2.phase === 'sudden_death') {
-          handleSuddenDeathAnswer(room2, info2.playerIndex, msg.answerIndex);
-        } else {
-          handleAnswer(room2, info2.playerIndex, msg.answerIndex);
-        }
-        break;
- 
-      case 'emote':
-        // Player sent an emote
-        const info3 = playerMap.get(ws);
-        if (!info3) return;
-        const room3 = rooms.get(info3.roomId);
-        if (!room3) return;
-        handleEmote(room3, info3.playerIndex, msg.emoji);
-        break;
-    }
-  });
- 
-  ws.on('close', () => {
-    console.log('Connection closed');
-    removeFromQueue(ws);
- 
-    // If player was in a room, handle disconnect
-    const info = playerMap.get(ws);
-    if (info) {
-      const room = rooms.get(info.roomId);
-      if (room) {
-        const player = room.players[info.playerIndex];
-        if (player && !player.eliminated) {
-          player.disconnected = true;
-          player.eliminated = true;
-          player.answered = true; // Don't wait for their answer
-          
-          broadcast(room, {
-            type: 'player_disconnected',
-            playerIndex: info.playerIndex,
-            name: player.name,
-          });
- 
-          console.log(`${player.name} disconnected from room ${room.id}`);
- 
-          // Check if enough players remain
-          const remaining = room.players.filter(p => !p.eliminated);
-          
-          if (remaining.length < 2) {
-            // Not enough players — end the game
-            clearTimeout(room.questionTimer);
-            clearTimeout(room.topicTimer);
-            if (remaining.length === 1) {
-              // Last player standing wins
-              const winner = remaining[0];
-              broadcast(room, {
-                type: 'game_over',
-                standings: room.players.map((p, i) => ({
-                  index: p.index, name: p.name,
-                  totalScore: p.score || 0,
-                  place: p === winner ? 1 : p.eliminated ? (room.players.filter(x => x.eliminated).indexOf(p) + 2) : 2,
-                })).sort((a, b) => a.place - b.place),
-                winnerIndex: winner.index,
-                winnerName: winner.name,
-              });
-            }
-            // Clean up room
-            setTimeout(() => {
-              room.players.forEach(p => playerMap.delete(p.ws));
-              rooms.delete(room.id);
-            }, 5000);
-            return;
-          }
- 
-          // If in playing phase, check if all remaining players have answered
-          if (room.phase === 'playing') {
-            const active = room.players.filter(p => !p.eliminated);
-            if (active.every(p => p.answered)) {
-              clearTimeout(room.questionTimer);
-              setTimeout(() => revealAnswer(room), 300);
-            }
-          }
- 
-          // If in topic_selection phase, check if all remaining players have picked
-          if (room.phase === 'topic_selection') {
-            const active = room.players.filter(p => !p.eliminated);
-            if (active.every(p => p.topicPick)) {
-              clearTimeout(room.topicTimer);
-              setTimeout(() => finishTopicSelection(room), 500);
-            }
-          }
- 
-          // If in sudden_death phase, resolve it
-          if (room.phase === 'sudden_death' && room.sdPlayers) {
-            const sdOpponent = room.sdPlayers.find(p => p !== player);
-            if (sdOpponent) {
-              clearTimeout(room.questionTimer);
-              setTimeout(() => {
-                const sorted = [sdOpponent, player];
-                const allActive = room.players.filter(p => !p.disconnected);
-                endGame(room, [...sorted, ...allActive.filter(p => p !== sdOpponent && p !== player)]);
-              }, 1000);
-            }
-          }
-        }
-      }
-      playerMap.delete(ws);
-    }
-  });
-});
- 
-server.listen(PORT, () => {
-  console.log(`Mindbrawl server running on port ${PORT}`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
-});
+module.exports = {
+history:[
+  {q:"Year World War II ended?",opts:["1943","1944","1945","1946"],a:2,d:1},
+  {q:"First US president?",opts:["Abraham Lincoln","Thomas Jefferson","George Washington","John Adams"],a:2,d:1},
+  {q:"Ancient wonder in Alexandria?",opts:["The Colossus","The Lighthouse","The Mausoleum","The Hanging Gardens"],a:1,d:1},
+  {q:"Berlin Wall fell in which year?",opts:["1987","1988","1989","1990"],a:2,d:1},
+  {q:"Who was the first man on the Moon?",opts:["Buzz Aldrin","Yuri Gagarin","Neil Armstrong","John Glenn"],a:2,d:1},
+  {q:"Which empire built the Colosseum?",opts:["Greek","Ottoman","Roman","Byzantine"],a:2,d:1},
+  {q:"Year the French Revolution began?",opts:["1776","1789","1799","1804"],a:1,d:1},
+  {q:"What ship sank in April 1912?",opts:["Lusitania","Britannic","Titanic","Olympic"],a:2,d:1},
+  {q:"Who painted the Sistine Chapel ceiling?",opts:["Leonardo da Vinci","Raphael","Caravaggio","Michelangelo"],a:3,d:1},
+  {q:"Which country first gave women the vote?",opts:["USA","UK","New Zealand","France"],a:2,d:1},
+  {q:"Who was known as the Iron Lady?",opts:["Angela Merkel","Indira Gandhi","Margaret Thatcher","Golda Meir"],a:2,d:2},
+  {q:"The Magna Carta was signed in which year?",opts:["1066","1215","1314","1492"],a:1,d:2},
+  {q:"Which civilization built Machu Picchu?",opts:["Maya","Aztec","Inca","Olmec"],a:2,d:2},
+  {q:"Who discovered penicillin?",opts:["Louis Pasteur","Alexander Fleming","Joseph Lister","Robert Koch"],a:1,d:2},
+  {q:"The Cold War was primarily between?",opts:["USA & China","USA & USSR","UK & Germany","France & Russia"],a:1,d:2},
+  {q:"Which war was fought from 1950–1953?",opts:["Vietnam War","Korean War","Gulf War","Falklands War"],a:1,d:2},
+  {q:"Who was the last pharaoh of Egypt?",opts:["Nefertiti","Hatshepsut","Cleopatra","Ramesses II"],a:2,d:2},
+  {q:"The Renaissance began in which country?",opts:["France","England","Spain","Italy"],a:3,d:2},
+  {q:"Who wrote the Communist Manifesto?",opts:["Lenin","Stalin","Karl Marx","Engels alone"],a:2,d:2},
+  {q:"What year did the Roman Empire fall?",opts:["376 AD","410 AD","453 AD","476 AD"],a:3,d:3},
+  {q:"The Silk Road connected China to where?",opts:["Japan","India","Mediterranean","Australia"],a:2,d:3},
+  {q:"Who led India to independence?",opts:["Nehru","Gandhi","Bose","Patel"],a:1,d:3},
+  {q:"The Black Death peaked in Europe in?",opts:["1247","1347","1447","1547"],a:1,d:3},
+  {q:"Who was the first emperor of China?",opts:["Kublai Khan","Sun Tzu","Qin Shi Huang","Confucius"],a:2,d:3},
+  {q:"D-Day landings occurred in which region?",opts:["Belgium","Netherlands","Normandy","Brittany"],a:2,d:3},
+  {q:"The Ottoman Empire fell after which war?",opts:["Crimean War","World War I","World War II","Balkan Wars"],a:1,d:3},
+  {q:"Who assassinated Abraham Lincoln?",opts:["Lee Harvey Oswald","John Wilkes Booth","Charles Guiteau","Leon Czolgosz"],a:1,d:3},
+  {q:"The Industrial Revolution started in?",opts:["France","Germany","Britain","USA"],a:2,d:3},
+  {q:"Which country was the first to land on the Moon?",opts:["Russia","China","USA","UK"],a:2},
+  {q:"Who was the first female prime minister of the UK?",opts:["Theresa May","Margaret Thatcher","Queen Victoria","Elizabeth I"],a:1},
+  {q:"The Treaty of Versailles ended which war?",opts:["Napoleonic Wars","World War I","World War II","Seven Years War"],a:1},
+  {q:"Which ancient city was buried by Mount Vesuvius?",opts:["Rome","Athens","Pompeii","Carthage"],a:2},
+  {q:"Who was the first president of South Africa after apartheid?",opts:["Desmond Tutu","Nelson Mandela","Thabo Mbeki","F.W. de Klerk"],a:1},
+  {q:"Which empire was ruled by Genghis Khan?",opts:["Ottoman","Mongol","Persian","Roman"],a:1},
+  {q:"What year did the American Civil War begin?",opts:["1850","1861","1870","1845"],a:1},
+  {q:"Who led the Soviet Union during WWII?",opts:["Lenin","Stalin","Khrushchev","Trotsky"],a:1},
+  {q:"Which country gifted the Statue of Liberty to the USA?",opts:["England","Spain","France","Germany"],a:2},
+  {q:"What was the last dynasty to rule China?",opts:["Ming","Song","Qing","Tang"],a:2},
+  {q:"Who was assassinated in Sarajevo in 1914?",opts:["Kaiser Wilhelm","Archduke Franz Ferdinand","Tsar Nicholas","Otto von Bismarck"],a:1},
+  {q:"Which civilization built the pyramids at Giza?",opts:["Roman","Greek","Egyptian","Persian"],a:2},
+  {q:"What ship did the Pilgrims sail to America?",opts:["Santa Maria","Victoria","Mayflower","Endeavour"],a:2},
+  {q:"Who was the first emperor of Rome?",opts:["Julius Caesar","Nero","Augustus","Caligula"],a:2},
+  {q:"What event started the Great Depression?",opts:["WWI","Stock market crash of 1929","Pearl Harbor","Dust Bowl"],a:1},
+  {q:"What country did Napoleon rule?",opts:["Spain","England","France","Italy"],a:2},
+  {q:"Who led the US civil rights movement?",opts:["Malcolm X","Martin Luther King Jr.","Rosa Parks","Frederick Douglass"],a:1},
+  {q:"Which city was divided by a wall from 1961 to 1989?",opts:["Vienna","Prague","Berlin","Warsaw"],a:2},
+  {q:"Which war was called The War to End All Wars?",opts:["WWII","WWI","Korean War","Crimean War"],a:1},
+  {q:"What year did the Spanish Armada invade England?",opts:["1492","1588","1605","1620"],a:1},
+  {q:"Who was the first female pharaoh of Egypt?",opts:["Cleopatra","Nefertiti","Hatshepsut","Ankhesenamun"],a:2},
+  {q:"What was the capital of the Byzantine Empire?",opts:["Rome","Athens","Constantinople","Alexandria"],a:2}
+],
+geography:[
+  {q:"Capital of Australia?",opts:["Sydney","Melbourne","Brisbane","Canberra"],a:3,d:1},
+  {q:"Longest river in the world?",opts:["Amazon","Yangtze","Nile","Mississippi"],a:2,d:1},
+  {q:"How many countries in Africa?",opts:["44","54","64","74"],a:1,d:1},
+  {q:"Smallest country in the world?",opts:["Monaco","San Marino","Vatican City","Liechtenstein"],a:2,d:1},
+  {q:"Which country has the most natural lakes?",opts:["Russia","USA","Brazil","Canada"],a:3,d:1},
+  {q:"Capital of Canada?",opts:["Toronto","Vancouver","Ottawa","Montreal"],a:2,d:1},
+  {q:"Largest ocean on Earth?",opts:["Atlantic","Indian","Arctic","Pacific"],a:3,d:1},
+  {q:"Amazon river flows mostly through which country?",opts:["Colombia","Peru","Venezuela","Brazil"],a:3,d:1},
+  {q:"Capital of New Zealand?",opts:["Auckland","Christchurch","Wellington","Dunedin"],a:2,d:1},
+  {q:"How many time zones does Russia span?",opts:["9","11","13","15"],a:1,d:1},
+  {q:"Tallest mountain on Earth?",opts:["K2","Kangchenjunga","Mount Everest","Lhotse"],a:2,d:2},
+  {q:"Which desert is the largest?",opts:["Sahara","Gobi","Arabian","Antarctic"],a:3,d:2},
+  {q:"Capital of Turkey?",opts:["Istanbul","Ankara","Izmir","Antalya"],a:1,d:2},
+  {q:"Which country has the most islands?",opts:["Indonesia","Philippines","Sweden","Japan"],a:2,d:2},
+  {q:"The Dead Sea borders Israel and?",opts:["Egypt","Lebanon","Jordan","Syria"],a:2,d:2},
+  {q:"Which continent has the most countries?",opts:["Asia","Europe","Africa","South America"],a:2,d:2},
+  {q:"What is the smallest US state?",opts:["Delaware","Connecticut","Rhode Island","Hawaii"],a:2,d:2},
+  {q:"Lake Baikal is in which country?",opts:["Mongolia","China","Kazakhstan","Russia"],a:3,d:2},
+  {q:"Capital of Switzerland?",opts:["Zurich","Geneva","Bern","Basel"],a:2,d:2},
+  {q:"Which strait separates Europe from Asia?",opts:["Gibraltar","Hormuz","Bosphorus","Malacca"],a:2,d:3},
+  {q:"Greenland belongs to which country?",opts:["Canada","Iceland","Norway","Denmark"],a:3,d:3},
+  {q:"Which African country has the largest population?",opts:["Ethiopia","Egypt","South Africa","Nigeria"],a:3,d:3},
+  {q:"The Great Barrier Reef is off which coast?",opts:["Brazil","Australia","Thailand","Mexico"],a:1,d:3},
+  {q:"Capital of South Korea?",opts:["Busan","Incheon","Seoul","Daegu"],a:2,d:3},
+  {q:"Which river runs through Paris?",opts:["Rhine","Danube","Thames","Seine"],a:3,d:3},
+  {q:"Mount Kilimanjaro is in which country?",opts:["Kenya","Uganda","Tanzania","Ethiopia"],a:2,d:3},
+  {q:"How many continents are there?",opts:["5","6","7","8"],a:2,d:3},
+  {q:"Which is the only continent with no deserts?",opts:["Antarctica","Europe","South America","Australia"],a:1,d:3},
+  {q:"Which country has the longest coastline?",opts:["Australia","Russia","Indonesia","Canada"],a:3},
+  {q:"What is the capital of Egypt?",opts:["Alexandria","Luxor","Cairo","Giza"],a:2},
+  {q:"Which river runs through London?",opts:["Seine","Danube","Rhine","Thames"],a:3},
+  {q:"What is the largest island in the world?",opts:["Madagascar","Borneo","Greenland","New Guinea"],a:2},
+  {q:"Which country is shaped like a boot?",opts:["Spain","Greece","Italy","Portugal"],a:2},
+  {q:"What is the capital of Japan?",opts:["Osaka","Kyoto","Tokyo","Hiroshima"],a:2},
+  {q:"Which country is known as the Land of the Rising Sun?",opts:["China","Thailand","Japan","South Korea"],a:2},
+  {q:"What is the capital of Brazil?",opts:["Rio de Janeiro","São Paulo","Brasília","Salvador"],a:2},
+  {q:"Which country has the largest area in the world?",opts:["Canada","China","USA","Russia"],a:3},
+  {q:"Which African country was never colonized by Europeans?",opts:["Nigeria","Kenya","Ethiopia","Ghana"],a:2},
+  {q:"What is the largest lake in Africa?",opts:["Lake Chad","Lake Tanganyika","Lake Victoria","Lake Malawi"],a:2},
+  {q:"Which mountain range separates Europe from Asia?",opts:["Alps","Himalayas","Ural Mountains","Andes"],a:2},
+  {q:"Which European city is the City of Love?",opts:["Rome","Venice","Paris","Barcelona"],a:2},
+  {q:"What is the driest continent on Earth?",opts:["Africa","Asia","Antarctica","Australia"],a:2},
+  {q:"What is the smallest continent by land area?",opts:["Europe","Australia","Antarctica","South America"],a:1},
+  {q:"What is the capital of Argentina?",opts:["Santiago","Lima","Buenos Aires","Bogotá"],a:2},
+  {q:"Which country has the most volcanoes?",opts:["Japan","Italy","Indonesia","Iceland"],a:2},
+  {q:"What sea lies between Africa and Europe?",opts:["Red Sea","Black Sea","Mediterranean Sea","Caspian Sea"],a:2},
+  {q:"Which continent spans all four hemispheres?",opts:["Asia","Africa","South America","Europe"],a:1},
+  {q:"What is the capital of Thailand?",opts:["Hanoi","Jakarta","Manila","Bangkok"],a:3},
+  {q:"Which two countries share the longest border?",opts:["USA & Mexico","Russia & China","USA & Canada","Brazil & Argentina"],a:2},
+  {q:"What is the deepest ocean trench?",opts:["Tonga Trench","Java Trench","Mariana Trench","Puerto Rico Trench"],a:2}
+],
+movies:[
+  {q:"Director of The Dark Knight?",opts:["Spielberg","Ridley Scott","Christopher Nolan","James Cameron"],a:2,d:1},
+  {q:"First film to win Best Picture Oscar?",opts:["Sunrise","Wings","The Broadway Melody","Gone with the Wind"],a:1,d:1},
+  {q:"Planet in Avatar 2009?",opts:["Pandora","Arrakis","Endor","Hoth"],a:0,d:1},
+  {q:"Who plays Iron Man in the MCU?",opts:["Chris Evans","Chris Hemsworth","Robert Downey Jr.","Mark Ruffalo"],a:2,d:1},
+  {q:"\"You had me at hello\" is from which film?",opts:["Sleepless in Seattle","Notting Hill","Jerry Maguire","Pretty Woman"],a:2,d:1},
+  {q:"Highest-grossing film of all time?",opts:["Titanic","Avengers: Endgame","Avatar","The Force Awakens"],a:2,d:1},
+  {q:"Who directed Pulp Fiction?",opts:["Martin Scorsese","Quentin Tarantino","David Fincher","Coen Brothers"],a:1,d:1},
+  {q:"Which actor played Forrest Gump?",opts:["Tom Cruise","Kevin Costner","Tom Hanks","Robin Williams"],a:2,d:1},
+  {q:"Year the original Jurassic Park was released?",opts:["1991","1992","1993","1994"],a:2,d:1},
+  {q:"Who played The Joker in The Dark Knight?",opts:["Joaquin Phoenix","Jared Leto","Heath Ledger","Jack Nicholson"],a:2,d:2},
+  {q:"What is the name of the AI in 2001: A Space Odyssey?",opts:["Skynet","WOPR","HAL 9000","GLaDOS"],a:2,d:2},
+  {q:"Who directed Schindler's List?",opts:["Ridley Scott","Steven Spielberg","Francis Ford Coppola","Martin Scorsese"],a:1,d:2},
+  {q:"Which film features the quote \"Here's looking at you, kid\"?",opts:["The Maltese Falcon","Casablanca","Citizen Kane","Gone with the Wind"],a:1,d:2},
+  {q:"What color is the pill Neo takes in The Matrix?",opts:["Blue","Green","Red","White"],a:2,d:2},
+  {q:"Who plays Jack in Titanic?",opts:["Brad Pitt","Johnny Depp","Leonardo DiCaprio","Matt Damon"],a:2,d:2},
+  {q:"Which Pixar film features a rat who cooks?",opts:["Up","Ratatouille","Coco","Inside Out"],a:1,d:2},
+  {q:"What is Indiana Jones's real first name?",opts:["Henry","James","William","Robert"],a:0,d:2},
+  {q:"Who directed The Godfather?",opts:["Martin Scorsese","Brian De Palma","Francis Ford Coppola","Sidney Lumet"],a:2,d:2},
+  {q:"Which film won the first Best Animated Feature Oscar?",opts:["Toy Story","Shrek","Monsters Inc","Finding Nemo"],a:1,d:3},
+  {q:"In The Shining, what is the hotel called?",opts:["Bates Motel","The Overlook","The Stanley","Hill House"],a:1,d:3},
+  {q:"Who plays Wolverine in the X-Men films?",opts:["Russell Crowe","Liam Neeson","Hugh Jackman","Christian Bale"],a:2,d:3},
+  {q:"What year was the first Toy Story released?",opts:["1993","1994","1995","1996"],a:2,d:3},
+  {q:"Which film has the quote \"I am your father\"?",opts:["A New Hope","The Empire Strikes Back","Return of the Jedi","Revenge of the Sith"],a:1,d:3},
+  {q:"Who directed Inception?",opts:["Ridley Scott","Christopher Nolan","Denis Villeneuve","James Cameron"],a:1,d:3},
+  {q:"What is the fictional country in Black Panther?",opts:["Zamunda","Wakanda","Genovia","Latveria"],a:1,d:3},
+  {q:"Which Studio Ghibli film features a bathhouse?",opts:["My Neighbor Totoro","Spirited Away","Howl's Moving Castle","Princess Mononoke"],a:1,d:3},
+  {q:"Who played the T-800 in The Terminator?",opts:["Sylvester Stallone","Bruce Willis","Arnold Schwarzenegger","Jean-Claude Van Damme"],a:2,d:3},
+  {q:"Who directed the Lord of the Rings trilogy?",opts:["Steven Spielberg","Peter Jackson","James Cameron","Ridley Scott"],a:1},
+  {q:"What is the highest-grossing animated film?",opts:["Toy Story 4","Frozen II","The Lion King (2019)","Inside Out 2"],a:3},
+  {q:"Which film features the quote \"I see dead people\"?",opts:["The Ring","The Sixth Sense","The Others","Ghost"],a:1},
+  {q:"Who played the Joker in the 2019 film Joker?",opts:["Heath Ledger","Jared Leto","Joaquin Phoenix","Jack Nicholson"],a:2},
+  {q:"What year was the first Star Wars film released?",opts:["1975","1977","1979","1980"],a:1},
+  {q:"In Back to the Future, what speed triggers time travel?",opts:["55 mph","77 mph","88 mph","100 mph"],a:2},
+  {q:"In The Shining, what word does Danny write that his mother sees in the mirror?",opts:["MURDER","REDRUM","HELLO","HELP"],a:1},
+  {q:"In The Breakfast Club, who is known as The Basket Case?",opts:["Claire","Allison","Bender","Brian"],a:1},
+  {q:"In Empire Strikes Back, what does Vader actually say to Luke?",opts:["Luke, I am your father","No, I am your father","I am your father, Luke","Join me, I am your father"],a:1},
+  {q:"In Dirty Dancing, Johnny says: Nobody puts ______ in a corner.",opts:["Penny","Baby","Frances","Sandy"],a:1},
+  {q:"In Coming to America, what fictional nation is Prince Akeem from?",opts:["Wakanda","Zamunda","Genovia","Timbuktu"],a:1},
+  {q:"In Top Gun, what is Maverick's real name?",opts:["Tom Kazansky","Pete Mitchell","Nick Bradshaw","Mike Metcalf"],a:1},
+  {q:"In E.T., what candy does Elliott use to lure E.T.?",opts:["M&Ms","Reese's Pieces","Skittles","Hershey's Kisses"],a:1},
+  {q:"In Forrest Gump, what is life like according to Forrest?",opts:["A long road","A box of chocolates","A feather in the wind","A game of ping-pong"],a:1},
+  {q:"In Pulp Fiction, what do they call a Quarter Pounder in Paris?",opts:["Le Big Mac","A Royale with Cheese","The French Quarter","Un Fromage Burger"],a:1},
+  {q:"In Home Alone, what are burglars Harry and Marv nicknamed?",opts:["The Sticky Fingers","The Wet Bandits","The Night Crawlers","The Stealth Brothers"],a:1},
+  {q:"In The Lion King, what does Hakuna Matata mean?",opts:["Stay strong","No worries","Long live the king","Beautiful journey"],a:1},
+  {q:"Hannibal Lecter ate a liver with fava beans and a nice what?",opts:["Merlot","Chianti","Chardonnay","Cabernet"],a:1},
+  {q:"In The Truman Show, Truman's full catchphrase ends with?",opts:["Good night!","Good afternoon, good evening, and good night!","Have a great day!","See you on the other side!"],a:1},
+  {q:"In Die Hard, which floor is the Nakatomi Plaza party on?",opts:["20th","30th","40th","50th"],a:1},
+  {q:"In Terminator 2, what is the T-1000 made of?",opts:["Solid steel","Liquid metal","Nanobots","Plasma"],a:1},
+  {q:"In Speed, what speed must the bus stay above?",opts:["40 mph","50 mph","60 mph","70 mph"],a:1},
+  {q:"In Ghostbusters, who is the Keymaster?",opts:["Peter Venkman","Louis Tully","Dana Barrett","Egon Spengler"],a:1},
+  {q:"In Independence Day, how does Jeff Goldblum disable the alien shields?",opts:["A nuclear bomb","A computer virus","A Morse code signal","A satellite laser"],a:1}
+],
+sports:[
+  {q:"Players on court in basketball?",opts:["4","5","6","7"],a:1,d:1},
+  {q:"Most FIFA World Cup wins?",opts:["Germany","Argentina","Italy","Brazil"],a:3,d:1},
+  {q:"Score after deuce in tennis?",opts:["Love","Advantage","Set point","Match point"],a:1,d:1},
+  {q:"Holes in standard golf round?",opts:["9","12","18","21"],a:2,d:1},
+  {q:"Which country hosted the 2016 Summer Olympics?",opts:["China","UK","Brazil","Japan"],a:2,d:1},
+  {q:"Players in a rugby union team?",opts:["11","13","15","17"],a:2,d:1},
+  {q:"The Ryder Cup is contested in which sport?",opts:["Tennis","Golf","Cricket","Polo"],a:1,d:1},
+  {q:"Which boxer was known as The Greatest?",opts:["Joe Frazier","Mike Tyson","Muhammad Ali","Sugar Ray Leonard"],a:2,d:1},
+  {q:"How many Grand Slam titles did Serena Williams win?",opts:["19","21","23","25"],a:2,d:1},
+  {q:"Country with most Olympic gold medals overall?",opts:["Russia","China","Germany","USA"],a:3,d:2},
+  {q:"How many players on a baseball team?",opts:["7","8","9","10"],a:2,d:2},
+  {q:"The Tour de France is which sport?",opts:["Running","Cycling","Swimming","Triathlon"],a:1,d:2},
+  {q:"Which country invented cricket?",opts:["Australia","India","South Africa","England"],a:3,d:2},
+  {q:"How long is an Olympic swimming pool in meters?",opts:["25","50","75","100"],a:1,d:2},
+  {q:"Which sport uses a shuttlecock?",opts:["Tennis","Squash","Badminton","Table Tennis"],a:2,d:2},
+  {q:"In which city were the first modern Olympics held?",opts:["Paris","London","Athens","Rome"],a:2,d:2},
+  {q:"How many points is a touchdown worth?",opts:["3","5","6","7"],a:2,d:2},
+  {q:"Which country has won the most Cricket World Cups?",opts:["India","West Indies","England","Australia"],a:3,d:2},
+  {q:"What does FIFA stand for (first word)?",opts:["Federal","Fédération","Football","Foundation"],a:1,d:3},
+  {q:"A regulation soccer match is how many minutes?",opts:["80","85","90","100"],a:2,d:3},
+  {q:"Which athlete has the most Olympic medals ever?",opts:["Usain Bolt","Carl Lewis","Michael Phelps","Mark Spitz"],a:2,d:3},
+  {q:"In F1, what color flag means danger?",opts:["Red","Blue","Yellow","Black"],a:2,d:3},
+  {q:"How many sets to win a men's Grand Slam tennis match?",opts:["2","3","4","5"],a:1,d:3},
+  {q:"Which sport is played at Wimbledon?",opts:["Golf","Cricket","Tennis","Rugby"],a:2,d:3},
+  {q:"The Super Bowl is the final of which league?",opts:["NBA","MLB","NHL","NFL"],a:3,d:3},
+  {q:"Which martial art is an Olympic sport from Japan?",opts:["Karate","Kung Fu","Judo","Taekwondo"],a:2,d:3},
+  {q:"How many rings are on the Olympic flag?",opts:["4","5","6","7"],a:1,d:3},
+  {q:"Which country has won the most rugby World Cups?",opts:["New Zealand","South Africa","England","Australia"],a:1},
+  {q:"How many players are on a volleyball team on court?",opts:["4","5","6","7"],a:2},
+  {q:"In which sport do you perform a slam dunk?",opts:["Volleyball","Tennis","Basketball","Handball"],a:2},
+  {q:"Which country hosted the 2022 FIFA World Cup?",opts:["Russia","Japan","Qatar","USA"],a:2},
+  {q:"What is the maximum score in a single frame of bowling?",opts:["10","20","30","50"],a:2},
+  {q:"How many periods in an NHL hockey game?",opts:["2","3","4","5"],a:1},
+  {q:"In baseball, how many strikes make an out?",opts:["2","3","4","5"],a:1},
+  {q:"How long is a marathon in miles?",opts:["20","24","26.2","30"],a:2},
+  {q:"What is the national sport of Japan?",opts:["Karate","Judo","Sumo","Kendo"],a:2},
+  {q:"Which country hosts the Tour de France?",opts:["Spain","Italy","France","Belgium"],a:2},
+  {q:"What is the diameter of a basketball hoop in inches?",opts:["16","18","20","22"],a:1},
+  {q:"How many points is a try worth in rugby union?",opts:["3","4","5","7"],a:2},
+  {q:"What is the highest belt rank in most martial arts?",opts:["Red","Black","White","Gold"],a:1},
+  {q:"In which sport can you score a hole in one?",opts:["Tennis","Bowling","Cricket","Golf"],a:3},
+  {q:"In which sport do players use a puck?",opts:["Field Hockey","Lacrosse","Ice Hockey","Curling"],a:2},
+  {q:"Which sport has positions called libero and setter?",opts:["Basketball","Tennis","Volleyball","Baseball"],a:2},
+  {q:"What is the width of a football goal in meters?",opts:["6.32","7.32","8.32","9.32"],a:1},
+  {q:"How many laps in a Daytona 500 race?",opts:["100","200","300","400"],a:1},
+  {q:"What surface is Wimbledon played on?",opts:["Clay","Hard court","Grass","Carpet"],a:2},
+  {q:"How many quarters in an NFL football game?",opts:["2","3","4","5"],a:2},
+  {q:"What is the term for three consecutive strikes in bowling?",opts:["Hat trick","Triple","Turkey","Trifecta"],a:2},
+  {q:"Which country invented basketball?",opts:["USA","Canada","England","France"],a:0},
+  {q:"In soccer, what is an own goal?",opts:["Scoring from midfield","Scoring in extra time","Scoring against your own team","A penalty goal"],a:2}
+],
+music:[
+  {q:"Strings on a standard guitar?",opts:["4","5","6","7"],a:2,d:1},
+  {q:"Band behind Bohemian Rhapsody?",opts:["Led Zeppelin","The Beatles","Queen","The Rolling Stones"],a:2,d:1},
+  {q:"BPM stands for?",opts:["Beats Per Minute","Bass Per Measure","Bars Per Movement","Beat Pattern Mode"],a:0,d:1},
+  {q:"Instrument with 88 keys?",opts:["Organ","Piano","Harpsichord","Accordion"],a:1,d:1},
+  {q:"Who is known as the Queen of Pop?",opts:["Beyoncé","Rihanna","Madonna","Lady Gaga"],a:2,d:1},
+  {q:"Best-selling album of all time?",opts:["Back in Black","Thriller","Dark Side of the Moon","Hotel California"],a:1,d:1},
+  {q:"Freddie Mercury was lead singer of which band?",opts:["Aerosmith","KISS","Queen","Led Zeppelin"],a:2,d:1},
+  {q:"How many strings does a violin have?",opts:["3","4","5","6"],a:1,d:1},
+  {q:"What nationality was Beethoven?",opts:["Austrian","French","German","Dutch"],a:2,d:1},
+  {q:"Who released the album Thriller in 1982?",opts:["Prince","Michael Jackson","David Bowie","Elton John"],a:1,d:2},
+  {q:"Which instrument does a drummer play?",opts:["Percussion","Strings","Brass","Woodwind"],a:0,d:2},
+  {q:"Who is known as the King of Rock and Roll?",opts:["Chuck Berry","Elvis Presley","Little Richard","Jerry Lee Lewis"],a:1,d:2},
+  {q:"Stairway to Heaven was by which band?",opts:["Pink Floyd","Deep Purple","Led Zeppelin","Black Sabbath"],a:2,d:2},
+  {q:"What genre did Bob Marley popularize?",opts:["Ska","Reggae","Calypso","Dancehall"],a:1,d:2},
+  {q:"How many members were in The Beatles?",opts:["3","4","5","6"],a:1,d:2},
+  {q:"Which instrument is Yo-Yo Ma famous for?",opts:["Violin","Viola","Cello","Double Bass"],a:2,d:2},
+  {q:"Who sang \"Like a Rolling Stone\"?",opts:["Bob Dylan","Bruce Springsteen","Neil Young","Tom Petty"],a:0,d:2},
+  {q:"What does DJ stand for?",opts:["Digital Jockey","Disc Jockey","Dance Jammer","Drop Juggler"],a:1,d:2},
+  {q:"Which country does K-pop come from?",opts:["Japan","China","South Korea","Thailand"],a:2,d:3},
+  {q:"Who composed The Four Seasons?",opts:["Mozart","Bach","Vivaldi","Handel"],a:2,d:3},
+  {q:"What woodwind instrument is black and has a single reed?",opts:["Oboe","Flute","Bassoon","Clarinet"],a:3,d:3},
+  {q:"Which rapper is known as Slim Shady?",opts:["50 Cent","Dr. Dre","Eminem","Snoop Dogg"],a:2,d:3},
+  {q:"Billie Eilish's debut album was called?",opts:["Happier Than Ever","When We All Fall Asleep","Don't Smile at Me","Bad Guy"],a:1,d:3},
+  {q:"What time signature is a waltz in?",opts:["2/4","3/4","4/4","6/8"],a:1,d:3},
+  {q:"Which festival is held in the Nevada desert?",opts:["Coachella","Glastonbury","Burning Man","Lollapalooza"],a:2,d:3},
+  {q:"Who sang \"Imagine\"?",opts:["Paul McCartney","George Harrison","John Lennon","Ringo Starr"],a:2,d:3},
+  {q:"Which band wrote \"Hotel California\"?",opts:["Fleetwood Mac","The Eagles","Led Zeppelin","The Doors"],a:1},
+  {q:"What instrument does a bassist play?",opts:["Drums","Bass guitar","Keyboard","Saxophone"],a:1},
+  {q:"Which country does BTS come from?",opts:["Japan","China","South Korea","Thailand"],a:2},
+  {q:"Who is known as the \"Godfather of Soul\"?",opts:["Ray Charles","Stevie Wonder","James Brown","Marvin Gaye"],a:2},
+  {q:"How many keys does a standard piano have?",opts:["76","85","88","92"],a:2},
+  {q:"Which band released the album Abbey Road?",opts:["Rolling Stones","The Beatles","Led Zeppelin","The Who"],a:1},
+  {q:"What is the highest female singing voice?",opts:["Alto","Mezzo","Soprano","Tenor"],a:2},
+  {q:"What genre of music originated in New Orleans?",opts:["Rock","Country","Jazz","Blues"],a:2},
+  {q:"Which festival takes place in the California desert?",opts:["Lollapalooza","Glastonbury","Coachella","Bonnaroo"],a:2},
+  {q:"What is Taylor Swift's first album called?",opts:["Fearless","1989","Taylor Swift","Reputation"],a:2},
+  {q:"Which artist had a hit with Purple Rain?",opts:["David Bowie","Elton John","Prince","Stevie Wonder"],a:2},
+  {q:"What genre did Elvis help popularize?",opts:["Jazz","Country","Rock and Roll","Blues"],a:2},
+  {q:"What award gives golden gramophone trophies?",opts:["MTV Awards","Brit Awards","Grammy Awards","Billboard Awards"],a:2},
+  {q:"Who sang Rolling in the Deep?",opts:["Beyoncé","Rihanna","Adele","Taylor Swift"],a:2},
+  {q:"Which instrument is played with a bow?",opts:["Guitar","Flute","Violin","Trumpet"],a:2},
+  {q:"What is the lowest male singing voice?",opts:["Tenor","Baritone","Bass","Alto"],a:2},
+  {q:"Who wrote the opera The Magic Flute?",opts:["Beethoven","Bach","Mozart","Handel"],a:2},
+  {q:"Which country does flamenco music come from?",opts:["Portugal","Italy","Spain","France"],a:2},
+  {q:"What is the term for playing music without preparation?",opts:["Composing","Arranging","Improvising","Conducting"],a:2},
+  {q:"Which instrument family does the trumpet belong to?",opts:["Woodwind","String","Brass","Percussion"],a:2},
+  {q:"Who is known for the song Bohemian Rhapsody?",opts:["Elton John","Freddie Mercury","David Bowie","Mick Jagger"],a:1},
+  {q:"What is a group of four musicians called?",opts:["Trio","Quartet","Quintet","Ensemble"],a:1},
+  {q:"Which country invented karaoke?",opts:["South Korea","China","Japan","Philippines"],a:2},
+  {q:"What tempo marking means very fast?",opts:["Adagio","Andante","Allegro","Presto"],a:3}
+],
+tech:[
+  {q:"HTML stands for?",opts:["Hyper Text Markup Language","High Tech Modern Language","Hyper Transfer Media Link","Home Tool Markup Language"],a:0,d:1},
+  {q:"Company that created the iPhone?",opts:["Samsung","Google","Apple","Microsoft"],a:2,d:1},
+  {q:"Binary of decimal 10?",opts:["1000","1010","1100","1001"],a:1,d:1},
+  {q:"Co-founder of Apple with Steve Jobs?",opts:["Bill Gates","Steve Wozniak","Larry Page","Elon Musk"],a:1,d:1},
+  {q:"CPU stands for?",opts:["Central Processing Unit","Computer Power Unit","Core Processing Utility","Central Program Unit"],a:0,d:1},
+  {q:"Which company owns YouTube?",opts:["Meta","Microsoft","Amazon","Google"],a:3,d:1},
+  {q:"Language known as the language of the web?",opts:["Python","Java","JavaScript","C++"],a:2,d:1},
+  {q:"Year the first iPhone was released?",opts:["2005","2006","2007","2008"],a:2,d:1},
+  {q:"What does Wi-Fi stand for?",opts:["Wireless Fidelity","Wide Frequency","Wireless Frequency Interface","It is a brand name"],a:3,d:1},
+  {q:"Which company made the first commercial GPS device?",opts:["Garmin","TomTom","Magellan","Nokia"],a:0,d:2},
+  {q:"What does RAM stand for?",opts:["Random Access Memory","Read Always Memory","Run Application Mode","Rapid Auto Memory"],a:0,d:2},
+  {q:"Who founded Amazon?",opts:["Elon Musk","Jeff Bezos","Bill Gates","Mark Zuckerberg"],a:1,d:2},
+  {q:"What programming language has a coffee cup logo?",opts:["Python","C#","Java","Ruby"],a:2,d:2},
+  {q:"How many bits in a byte?",opts:["4","6","8","16"],a:2,d:2},
+  {q:"What does USB stand for?",opts:["Universal Serial Bus","Ultra Speed Buffer","Unified System Bridge","Universal System Byte"],a:0,d:2},
+  {q:"Which company makes the Android OS?",opts:["Apple","Samsung","Google","Microsoft"],a:2,d:2},
+  {q:"What year was Facebook founded?",opts:["2002","2004","2006","2008"],a:1,d:2},
+  {q:"The first computer programmer is often considered to be?",opts:["Alan Turing","Grace Hopper","Ada Lovelace","Charles Babbage"],a:2,d:2},
+  {q:"What does SSD stand for?",opts:["Super Speed Disk","Solid State Drive","System Storage Device","Serial Signal Data"],a:1,d:3},
+  {q:"Which company created Windows?",opts:["Apple","IBM","Google","Microsoft"],a:3,d:3},
+  {q:"What does API stand for?",opts:["Application Programming Interface","Auto Program Input","Advanced Protocol Integration","Applied Processing Instance"],a:0,d:3},
+  {q:"Bitcoin was created by whom?",opts:["Vitalik Buterin","Satoshi Nakamoto","Elon Musk","Tim Berners-Lee"],a:1,d:3},
+  {q:"What does GPU stand for?",opts:["General Processing Unit","Graphics Processing Unit","Global Power Unit","Grid Pixel Utility"],a:1,d:3},
+  {q:"Which company makes the PlayStation?",opts:["Nintendo","Microsoft","Sony","Sega"],a:2,d:3},
+  {q:"What language is most used for iOS apps?",opts:["Java","Kotlin","Swift","C++"],a:2,d:3},
+  {q:"Who invented the World Wide Web?",opts:["Bill Gates","Steve Jobs","Tim Berners-Lee","Vint Cerf"],a:2,d:3},
+  {q:"What is the most popular programming language in 2024?",opts:["Java","Python","JavaScript","C++"],a:1,d:3},
+  {q:"What does URL stand for?",opts:["Universal Resource Locator","Uniform Resource Locator","United Reference Link","Universal Reference Locator"],a:1},
+  {q:"Which company created the first smartphone?",opts:["Apple","Nokia","IBM","Motorola"],a:2},
+  {q:"What programming language is named after a type of coffee?",opts:["Python","Ruby","Java","C#"],a:2},
+  {q:"What does HTTP stand for?",opts:["HyperText Transfer Protocol","High Tech Transfer Process","Hyper Tool Transfer Protocol","Home Text Transfer Protocol"],a:0},
+  {q:"Who is the CEO of Tesla?",opts:["Jeff Bezos","Tim Cook","Elon Musk","Mark Zuckerberg"],a:2},
+  {q:"What does VPN stand for?",opts:["Virtual Personal Network","Virtual Private Network","Verified Protected Network","Visual Processing Node"],a:1},
+  {q:"What does AI stand for?",opts:["Auto Intelligence","Artificial Intelligence","Advanced Input","Automated Interface"],a:1},
+  {q:"What year was YouTube launched?",opts:["2003","2004","2005","2006"],a:2},
+  {q:"What was Facebook originally called?",opts:["FaceNet","TheFacebook","FriendBook","MyFace"],a:1},
+  {q:"Which company makes Ryzen processors?",opts:["Intel","Nvidia","AMD","Qualcomm"],a:2},
+  {q:"What was the first computer virus called?",opts:["ILOVEYOU","Melissa","Creeper","Stuxnet"],a:2},
+  {q:"What does IoT stand for?",opts:["Internet of Teams","Internet of Things","Input of Technology","Integrated Online Tools"],a:1},
+  {q:"Which company bought Instagram in 2012?",opts:["Google","Twitter","Facebook","Microsoft"],a:2},
+  {q:"What does PDF stand for?",opts:["Personal Data File","Portable Document Format","Print Design Format","Page Display File"],a:1},
+  {q:"What does CSS stand for in web design?",opts:["Computer Style Sheets","Cascading Style Sheets","Creative Site Styling","Code Style System"],a:1},
+  {q:"Which company created the search engine Bing?",opts:["Google","Apple","Microsoft","Yahoo"],a:2},
+  {q:"What does LAN stand for?",opts:["Large Area Network","Local Access Node","Local Area Network","Linked Application Network"],a:2},
+  {q:"Who founded SpaceX?",opts:["Jeff Bezos","Bill Gates","Elon Musk","Richard Branson"],a:2},
+  {q:"What does the \"www\" stand for in a URL?",opts:["Wide Web World","World Wide Web","Web World Wide","World Web Wide"],a:1},
+  {q:"What year was Twitter launched?",opts:["2004","2005","2006","2007"],a:2},
+  {q:"Which company makes the Nintendo Switch?",opts:["Sony","Microsoft","Sega","Nintendo"],a:3},
+  {q:"What does DNS stand for?",opts:["Digital Network Service","Domain Name System","Data Node Server","Direct Network Socket"],a:1},
+  {q:"What is the most used search engine in the world?",opts:["Bing","Yahoo","Google","DuckDuckGo"],a:2}
+],
+space:[
+  {q:"The Red Planet?",opts:["Venus","Jupiter","Mars","Saturn"],a:2,d:1},
+  {q:"Sunlight travel time to Earth?",opts:["2 minutes","8 minutes","20 minutes","1 hour"],a:1,d:1},
+  {q:"Name of our galaxy?",opts:["Andromeda","Triangulum","Milky Way","Whirlpool"],a:2,d:1},
+  {q:"First Moon landing mission?",opts:["Apollo 9","Apollo 10","Apollo 11","Apollo 12"],a:2,d:1},
+  {q:"Which planet has the most moons?",opts:["Jupiter","Saturn","Uranus","Neptune"],a:1,d:1},
+  {q:"Closest star to Earth?",opts:["Betelgeuse","Sirius","Proxima Centauri","Alpha Centauri A"],a:2,d:1},
+  {q:"First artificial satellite in space?",opts:["Explorer 1","Vostok 1","Sputnik 1","Luna 1"],a:2,d:1},
+  {q:"How long does Earth take to orbit the Sun?",opts:["265 days","365 days","400 days","465 days"],a:1,d:1},
+  {q:"Which planet rotates on its side?",opts:["Neptune","Venus","Uranus","Saturn"],a:2,d:1},
+  {q:"A light-year is a measure of?",opts:["Time","Speed","Distance","Brightness"],a:2,d:2},
+  {q:"Largest planet in our solar system?",opts:["Saturn","Neptune","Jupiter","Uranus"],a:2,d:2},
+  {q:"What is the hottest planet?",opts:["Mercury","Venus","Mars","Jupiter"],a:1,d:2},
+  {q:"Which planet is known for its rings?",opts:["Jupiter","Neptune","Uranus","Saturn"],a:3,d:2},
+  {q:"First woman in space?",opts:["Sally Ride","Mae Jemison","Valentina Tereshkova","Peggy Whitson"],a:2,d:2},
+  {q:"How many planets in our solar system?",opts:["7","8","9","10"],a:1,d:2},
+  {q:"What is a supernova?",opts:["A comet","An exploding star","A black hole","A galaxy"],a:1,d:2},
+  {q:"Which space agency launched the Hubble telescope?",opts:["ESA","Roscosmos","NASA","JAXA"],a:2,d:2},
+  {q:"Pluto was reclassified as a dwarf planet in?",opts:["2000","2003","2006","2009"],a:2,d:2},
+  {q:"What is the Sun mainly made of?",opts:["Helium","Oxygen","Iron","Hydrogen"],a:3,d:3},
+  {q:"Which rover landed on Mars in 2021?",opts:["Curiosity","Opportunity","Spirit","Perseverance"],a:3,d:3},
+  {q:"The International Space Station orbits Earth every?",opts:["45 minutes","90 minutes","3 hours","12 hours"],a:1,d:3},
+  {q:"What force keeps planets in orbit?",opts:["Magnetism","Friction","Gravity","Inertia"],a:2,d:3},
+  {q:"Which planet has the Great Red Spot?",opts:["Mars","Saturn","Neptune","Jupiter"],a:3,d:3},
+  {q:"What is the closest planet to the Sun?",opts:["Venus","Mars","Mercury","Earth"],a:2,d:3},
+  {q:"A black hole is formed from a collapsed?",opts:["Planet","Moon","Star","Asteroid"],a:2,d:3},
+  {q:"What is the name of Mars's largest moon?",opts:["Europa","Titan","Phobos","Ganymede"],a:2,d:3},
+  {q:"What is the name of NASA's most famous space telescope?",opts:["Kepler","Hubble","Spitzer","Chandra"],a:1},
+  {q:"Which planet is closest in size to Earth?",opts:["Mars","Mercury","Venus","Neptune"],a:2},
+  {q:"What is the name of the largest moon of Saturn?",opts:["Europa","Ganymede","Titan","Callisto"],a:2},
+  {q:"How many planets in our solar system have rings?",opts:["1","2","3","4"],a:3},
+  {q:"Who was the first American woman in space?",opts:["Mae Jemison","Sally Ride","Peggy Whitson","Christa McAuliffe"],a:1},
+  {q:"Who was the first human in space?",opts:["Neil Armstrong","Buzz Aldrin","Yuri Gagarin","John Glenn"],a:2},
+  {q:"What does NASA stand for?",opts:["National Aeronautics and Space Administration","North American Space Agency","National Aerospace and Science Administration","New Age Space Association"],a:0},
+  {q:"Which space probe first left the solar system?",opts:["Pioneer 10","Voyager 1","Voyager 2","New Horizons"],a:1},
+  {q:"What is a group of stars forming a pattern called?",opts:["Galaxy","Nebula","Constellation","Cluster"],a:2},
+  {q:"How many moons does Mars have?",opts:["0","1","2","4"],a:2},
+  {q:"What space station has been occupied since 2000?",opts:["Mir","Skylab","ISS","Tiangong"],a:2},
+  {q:"What is the second planet from the Sun?",opts:["Mercury","Venus","Earth","Mars"],a:1},
+  {q:"Which planet has the shortest day?",opts:["Mars","Earth","Saturn","Jupiter"],a:3},
+  {q:"What year did humans first land on the Moon?",opts:["1965","1967","1969","1971"],a:2},
+  {q:"What type of celestial object is Halley's?",opts:["Asteroid","Star","Comet","Moon"],a:2},
+  {q:"Which planet has the fastest winds in the solar system?",opts:["Jupiter","Uranus","Saturn","Neptune"],a:3},
+  {q:"What is the name of Mars's smaller moon?",opts:["Titan","Phobos","Deimos","Europa"],a:2},
+  {q:"Which planet was the first discovered by telescope?",opts:["Neptune","Saturn","Uranus","Pluto"],a:2},
+  {q:"What is the edge of a black hole called?",opts:["Singularity","Corona","Event horizon","Accretion disk"],a:2},
+  {q:"How many astronauts walked on the Moon in total?",opts:["2","6","12","24"],a:2},
+  {q:"What color is the sunset on Mars?",opts:["Red","Orange","Blue","Yellow"],a:2},
+  {q:"Which planet spins backwards compared to most others?",opts:["Mars","Jupiter","Neptune","Venus"],a:3},
+  {q:"What is the asteroid belt located between?",opts:["Earth and Mars","Mars and Jupiter","Jupiter and Saturn","Saturn and Uranus"],a:1},
+  {q:"What was the first animal sent into orbit?",opts:["A monkey","A dog","A cat","A mouse"],a:1}
+],
+games:[
+  {q:"Zelda series by which company?",opts:["Sega","Sony","Nintendo","Capcom"],a:2,d:1},
+  {q:"Year first PlayStation released?",opts:["1992","1994","1996","1998"],a:1,d:1},
+  {q:"Minecraft is a type of?",opts:["FPS","RPG","Sandbox","MOBA"],a:2,d:1},
+  {q:"Character who eats dots in a maze?",opts:["Pac-Man","Donkey Kong","Frogger","Q*bert"],a:0,d:1},
+  {q:"Master Chief is from which game?",opts:["Gears of War","Halo","Doom","Call of Duty"],a:1,d:1},
+  {q:"What animal is Sonic?",opts:["Fox","Rabbit","Hedgehog","Cat"],a:2,d:1},
+  {q:"Which game features building with blocks?",opts:["Fortnite","Roblox","Minecraft","Terraria"],a:2,d:1},
+  {q:"Which company makes Mario games?",opts:["Sega","Nintendo","Sony","Microsoft"],a:1,d:1},
+  {q:"GTA stands for?",opts:["Grand Theft Auto","Great Tactical Arena","Game Tournament Alliance","Global Task Agency"],a:0,d:1},
+  {q:"Year Fortnite Battle Royale launched?",opts:["2015","2016","2017","2018"],a:2,d:2},
+  {q:"What is the best-selling video game ever?",opts:["GTA V","Tetris","Minecraft","Wii Sports"],a:2,d:2},
+  {q:"Which game features a character named Link?",opts:["Final Fantasy","Zelda","Metroid","Fire Emblem"],a:1,d:2},
+  {q:"What does RPG stand for in gaming?",opts:["Real Player Game","Role Playing Game","Rapid Play Genre","Random Puzzle Grid"],a:1,d:2},
+  {q:"Which game has a Battle Royale mode with a storm?",opts:["PUBG","Apex Legends","Fortnite","Warzone"],a:2,d:2},
+  {q:"Who is Mario's brother?",opts:["Wario","Toad","Luigi","Yoshi"],a:2,d:2},
+  {q:"Which console was released in 2020?",opts:["Nintendo Switch","Xbox One","PS5","PS4"],a:2,d:2},
+  {q:"Kratos is the main character of?",opts:["Devil May Cry","Bayonetta","God of War","Dante's Inferno"],a:2,d:2},
+  {q:"What color is Pikachu?",opts:["Red","Blue","Green","Yellow"],a:3,d:2},
+  {q:"Which game popularized battle royale genre?",opts:["Fortnite","H1Z1","PUBG","Apex Legends"],a:2,d:3},
+  {q:"Elden Ring was made by?",opts:["Capcom","Bethesda","FromSoftware","Square Enix"],a:2,d:3},
+  {q:"What is the currency in Fortnite?",opts:["Robux","Gems","V-Bucks","Credits"],a:2,d:3},
+  {q:"Portal is famous for which device?",opts:["Gravity Gun","Portal Gun","Grapple Hook","Time Machine"],a:1,d:3},
+  {q:"Which game features the Creeper enemy?",opts:["Terraria","Roblox","Minecraft","Fortnite"],a:2,d:3},
+  {q:"The Last of Us is set during a?",opts:["War","Zombie apocalypse","Alien invasion","Pandemic"],a:3,d:3},
+  {q:"Which company makes the Xbox?",opts:["Sony","Nintendo","Microsoft","Sega"],a:2,d:3},
+  {q:"How many Pokémon were in the original games?",opts:["100","120","150","151"],a:3,d:3},
+  {q:"In World of Warcraft, what is the Alliance home city?",opts:["Orgrimmar","Thunder Bluff","Stormwind","Silvermoon"],a:2},
+  {q:"Which publisher is behind the Call of Duty series?",opts:["EA","Ubisoft","Activision","Bethesda"],a:2},
+  {q:"Which is the best-selling arcade game of all time?",opts:["Donkey Kong","Space Invaders","Pac-Man","Street Fighter II"],a:2},
+  {q:"Which Assassin's Creed game released first?",opts:["Black Flag","Assassin's Creed II","Brotherhood","Origins"],a:1},
+  {q:"Who plays Johnny Silverhand in Cyberpunk 2077?",opts:["Norman Reedus","Keanu Reeves","Tom Hardy","Oscar Isaac"],a:1},
+  {q:"Which game series has Fatality finishing moves?",opts:["Street Fighter","Tekken","Mortal Kombat","Soul Calibur"],a:2},
+  {q:"Commander Shepard is the hero of which series?",opts:["Halo","Dead Space","Mass Effect","Starfield"],a:2},
+  {q:"Which game has a protagonist named Kratos in Greek mythology?",opts:["Devil May Cry","Dante's Inferno","God of War","Bayonetta"],a:2},
+  {q:"What is the name of Mario's dinosaur companion?",opts:["Toad","Koopa","Yoshi","Birdo"],a:2},
+  {q:"Who is the protagonist in Red Dead Redemption 2?",opts:["John Marston","Dutch van der Linde","Arthur Morgan","Sadie Adler"],a:2},
+  {q:"In WoW, what are the two primary opposing factions?",opts:["Humans and Orcs","The Alliance and The Horde","The Empire and The Rebellion","The Guardians and The Taken"],a:1},
+  {q:"Which player ruined his guild's plan by charging in shouting his name?",opts:["Ninja","Leeroy Jenkins","PewDiePie","DrLupo"],a:1},
+  {q:"What was the max level in original Vanilla World of Warcraft?",opts:["100","80","60","50"],a:2},
+  {q:"Which sci-fi MMO is famous for real-money space battles?",opts:["Star Wars: The Old Republic","EVE Online","Destiny 2","Mass Effect"],a:1},
+  {q:"Which browser-based RPG had woodcutting and mining in Gielinor?",opts:["AdventureQuest","RuneScape","MapleStory","Club Penguin"],a:1},
+  {q:"In Fortnite, what shrinks the playable area?",opts:["The Fog","The Zone","The Storm","The Barrier"],a:2},
+  {q:"Which Call of Duty title launched free-to-play Warzone?",opts:["Black Ops","Modern Warfare (2019)","Vanguard","Infinite Warfare"],a:1},
+  {q:"What system in Apex Legends changed non-mic communication?",opts:["Smart Comms / Ping System","Waypoint Marker","Shouting","Echo Location"],a:0},
+  {q:"How many players start in a standard Fortnite match?",opts:["50","100","150","64"],a:1},
+  {q:"Which Counter-Strike map has a desert setting with sites A and B?",opts:["Mirage","Dust II","Inferno","Nuke"],a:1},
+  {q:"What service tracked TrueSkill rank in Halo 3?",opts:["PSN","Xbox Live","Battle.net","GameSpy"],a:1},
+  {q:"Which Call of Duty first introduced Zombies mode?",opts:["Modern Warfare 2","World at War","Black Ops II","Ghosts"],a:1},
+  {q:"In Overwatch, who says \"Cheers, love! The cavalry's here!\"?",opts:["Mercy","Tracer","Widowmaker","D.Va"],a:1},
+  {q:"What is Riot Games' tactical shooter with character abilities?",opts:["CS:GO","Valorant","Rainbow Six Siege","Team Fortress 2"],a:1},
+  {q:"In League of Legends, what structure must you destroy to win?",opts:["The Throne","The Nexus","The Core","The Ancient"],a:1},
+  {q:"Which Warcraft III mod invented the MOBA genre?",opts:["Smite","DotA","Heroes of the Storm","League of Legends"],a:1},
+  {q:"How many players are on a team in LoL or Dota 2?",opts:["3","4","5","6"],a:2},
+  {q:"In LoL, which lane has the Support and ADC?",opts:["Top Lane","Mid Lane","Bottom Lane","The Jungle"],a:2}
+],
+mythology:[
+  {q:"Greek god of the sea?",opts:["Zeus","Ares","Poseidon","Apollo"],a:2,d:1},
+  {q:"Norse god of thunder?",opts:["Odin","Loki","Freya","Thor"],a:3,d:1},
+  {q:"Medusa turns people to?",opts:["Gold","Stone","Ice","Dust"],a:1,d:1},
+  {q:"Labyrinth creature of Crete?",opts:["Sphinx","Minotaur","Hydra","Cerberus"],a:1,d:1},
+  {q:"Egyptian god of the dead?",opts:["Ra","Horus","Anubis","Osiris"],a:2,d:1},
+  {q:"Who opened the forbidden box?",opts:["Athena","Persephone","Pandora","Aphrodite"],a:2,d:1},
+  {q:"How many heads does the Hydra grow back?",opts:["1","2","3","4"],a:1,d:1},
+  {q:"Which hero completed 12 labors?",opts:["Perseus","Achilles","Hercules","Theseus"],a:2,d:1},
+  {q:"Odin's eight-legged horse?",opts:["Fenrir","Jörmungandr","Sleipnir","Huginn"],a:2,d:1},
+  {q:"River of the dead in Greek myth?",opts:["Lethe","Acheron","Styx","Phlegethon"],a:2,d:2},
+  {q:"Greek goddess of wisdom?",opts:["Hera","Artemis","Athena","Aphrodite"],a:2,d:2},
+  {q:"Who killed Medusa?",opts:["Theseus","Odysseus","Perseus","Achilles"],a:2,d:2},
+  {q:"What animal pulled Thor's chariot?",opts:["Wolves","Horses","Goats","Bears"],a:2,d:2},
+  {q:"Greek god of the underworld?",opts:["Ares","Hermes","Hades","Dionysus"],a:2,d:2},
+  {q:"Loki is the Norse god of?",opts:["War","Wisdom","Mischief","Thunder"],a:2,d:2},
+  {q:"What did King Midas turn things into?",opts:["Silver","Gold","Stone","Glass"],a:1,d:2},
+  {q:"Icarus flew too close to what?",opts:["The Moon","The Sea","The Sun","The Stars"],a:2,d:2},
+  {q:"Who ferried souls across the River Styx?",opts:["Hades","Hermes","Charon","Cerberus"],a:2,d:2},
+  {q:"The Phoenix rises from what?",opts:["Water","Ice","Ashes","Sand"],a:2,d:3},
+  {q:"Excalibur belonged to which king?",opts:["Charlemagne","Arthur","Richard","Leonidas"],a:1,d:3},
+  {q:"How many heads does Cerberus have?",opts:["1","2","3","5"],a:2,d:3},
+  {q:"Norse end of the world is called?",opts:["Valhalla","Ragnarök","Asgard","Niflheim"],a:1,d:3},
+  {q:"Who was the Greek hero of the Trojan War?",opts:["Perseus","Theseus","Achilles","Heracles"],a:2,d:3},
+  {q:"Egyptian god with a falcon head?",opts:["Anubis","Osiris","Horus","Thoth"],a:2,d:3},
+  {q:"What creature is half man, half horse?",opts:["Minotaur","Satyr","Centaur","Faun"],a:2,d:3},
+  {q:"Mjolnir is the weapon of which god?",opts:["Odin","Loki","Freyr","Thor"],a:3,d:3},
+  {q:"Who is the king of the Greek gods?",opts:["Poseidon","Hades","Zeus","Apollo"],a:2},
+  {q:"In Norse mythology, where do warriors go after death?",opts:["Asgard","Midgard","Valhalla","Helheim"],a:2},
+  {q:"Which Greek hero had a vulnerable heel?",opts:["Hercules","Perseus","Achilles","Theseus"],a:2},
+  {q:"What creature has the body of a lion and head of a human?",opts:["Griffin","Manticore","Sphinx","Chimera"],a:2},
+  {q:"Who is the Egyptian god of the Sun?",opts:["Osiris","Anubis","Ra","Horus"],a:2},
+  {q:"Who is the Greek god of war?",opts:["Apollo","Hermes","Ares","Hades"],a:2},
+  {q:"What is the Roman equivalent of Zeus?",opts:["Mars","Mercury","Jupiter","Neptune"],a:2},
+  {q:"What is the food of the Greek gods?",opts:["Nectar","Ambrosia","Mead","Soma"],a:1},
+  {q:"Which Greek titan held up the sky?",opts:["Prometheus","Kronos","Atlas","Hyperion"],a:2},
+  {q:"Who is the Japanese sun goddess?",opts:["Tsukuyomi","Izanami","Amaterasu","Susanoo"],a:2},
+  {q:"What is the Norse world tree called?",opts:["Midgard","Bifrost","Yggdrasil","Valhalla"],a:2},
+  {q:"Who stole fire from the gods for humans?",opts:["Atlas","Hercules","Prometheus","Perseus"],a:2},
+  {q:"What is the paradise for heroes in Greek afterlife?",opts:["Tartarus","Asphodel","Elysium","Olympus"],a:2},
+  {q:"Which Norse serpent encircles the world?",opts:["Fenrir","Sleipnir","Nidhogg","Jormungandr"],a:3},
+  {q:"Who is the Hindu god of destruction?",opts:["Vishnu","Brahma","Shiva","Ganesh"],a:2},
+  {q:"Who is the Greek goddess of love?",opts:["Athena","Artemis","Hera","Aphrodite"],a:3},
+  {q:"What is the Greek goddess of the hunt called?",opts:["Aphrodite","Athena","Artemis","Hera"],a:2},
+  {q:"Who is the Norse goddess of the underworld?",opts:["Freya","Frigg","Hel","Sif"],a:2},
+  {q:"What weapon does the Hindu god Vishnu carry?",opts:["Trident","Bow","Discus","Sword"],a:2},
+  {q:"Which Greek monster has nine heads?",opts:["Cerberus","Chimera","Hydra","Sphinx"],a:2},
+  {q:"Who is the Roman god of the sea?",opts:["Mars","Jupiter","Neptune","Pluto"],a:2},
+  {q:"What creature is half eagle and half lion?",opts:["Sphinx","Chimera","Griffin","Manticore"],a:2},
+  {q:"Which Norse god sacrificed an eye for wisdom?",opts:["Thor","Loki","Odin","Freyr"],a:2},
+  {q:"Who is the Egyptian goddess of magic?",opts:["Bastet","Hathor","Isis","Sekhmet"],a:2}
+],
+harrypotter:[
+  {q:"Harry's position in Quidditch?",opts:["Chaser","Keeper","Beater","Seeker"],a:3,d:1},
+  {q:"What is a Horcrux?",opts:["A spell","A soul container","A potion","A creature"],a:1,d:1},
+  {q:"Hogwarts headmaster in book 1?",opts:["Snape","McGonagall","Dumbledore","Hagrid"],a:2,d:1},
+  {q:"How many Deathly Hallows exist?",opts:["2","3","4","7"],a:1,d:1},
+  {q:"What animal is Hedwig?",opts:["Cat","Toad","Owl","Rat"],a:2,d:1},
+  {q:"Platform for the Hogwarts Express?",opts:["7½","8¾","9¾","10½"],a:2,d:1},
+  {q:"Who is the Half-Blood Prince?",opts:["Voldemort","Dumbledore","Snape","Draco"],a:2,d:1},
+  {q:"How many books in the HP series?",opts:["5","6","7","8"],a:2,d:1},
+  {q:"Which house values bravery?",opts:["Slytherin","Ravenclaw","Hufflepuff","Gryffindor"],a:3,d:1},
+  {q:"Voldemort's real first name?",opts:["Marvolo","Tom","Salazar","Lucius"],a:1,d:2},
+  {q:"What is the core of Harry's wand?",opts:["Dragon heartstring","Unicorn hair","Phoenix feather","Thestral tail"],a:2,d:2},
+  {q:"Who teaches Potions in Harry's first year?",opts:["McGonagall","Snape","Flitwick","Quirrell"],a:1,d:2},
+  {q:"What shape is Harry's scar?",opts:["Circle","Star","Lightning bolt","Crescent"],a:2,d:2},
+  {q:"What is the name of the Weasley house?",opts:["The Hollow","Shell Cottage","The Burrow","Grimmauld Place"],a:2,d:2},
+  {q:"Which spell disarms an opponent?",opts:["Stupefy","Expelliarmus","Protego","Reducto"],a:1,d:2},
+  {q:"What creature guards the Philosopher's Stone?",opts:["Dragon","Troll","Three-headed dog","Giant spider"],a:2,d:2},
+  {q:"What is Hermione's patronus?",opts:["Horse","Cat","Otter","Hare"],a:2,d:2},
+  {q:"Who gives Harry the invisibility cloak?",opts:["Sirius","Hagrid","Dumbledore","Snape"],a:2,d:2},
+  {q:"What position does Ron play in Quidditch?",opts:["Chaser","Seeker","Beater","Keeper"],a:3,d:3},
+  {q:"Which subject does Professor Binns teach?",opts:["Divination","Potions","History of Magic","Herbology"],a:2,d:3},
+  {q:"What is the name of Hagrid's dragon?",opts:["Norberta","Fang","Buckbeak","Aragog"],a:0,d:3},
+  {q:"Which spell produces light?",opts:["Nox","Lumos","Accio","Alohomora"],a:1,d:3},
+  {q:"What is the Marauder's Map phrase?",opts:["Open Sesame","I solemnly swear I am up to no good","Mischief managed","Reveal your secrets"],a:1,d:3},
+  {q:"Who kills Dumbledore?",opts:["Voldemort","Draco","Bellatrix","Snape"],a:3,d:3},
+  {q:"What form does Harry's patronus take?",opts:["Wolf","Phoenix","Stag","Lion"],a:2,d:3},
+  {q:"Dobby is what kind of creature?",opts:["Goblin","Gnome","House-elf","Pixie"],a:2,d:3},
+  {q:"What is the name of the pub in Diagon Alley?",opts:["The Three Broomsticks","The Leaky Cauldron","The Hog's Head","Madam Puddifoot's"],a:1},
+  {q:"Which Hogwarts house is associated with a badger?",opts:["Gryffindor","Slytherin","Ravenclaw","Hufflepuff"],a:3},
+  {q:"What type of dragon did Harry face in the Triwizard Tournament?",opts:["Norwegian Ridgeback","Hungarian Horntail","Chinese Fireball","Swedish Short-Snout"],a:1},
+  {q:"What is the name of the Weasley twins?",opts:["Fred and George","Bill and Charlie","Ron and Percy","Fred and Bill"],a:0},
+  {q:"Which spell is the Killing Curse?",opts:["Crucio","Sectumsempra","Avada Kedavra","Imperius"],a:2},
+  {q:"What is Dumbledore's first name?",opts:["Arthur","Severus","Albus","Remus"],a:2},
+  {q:"What does Professor Flitwick teach?",opts:["DADA","Potions","Charms","Herbology"],a:2},
+  {q:"Which Horcrux was in the Room of Requirement?",opts:["The Locket","The Cup","The Diadem","The Ring"],a:2},
+  {q:"What subject does McGonagall teach?",opts:["Potions","Charms","Transfiguration","Herbology"],a:2},
+  {q:"Which creature is only seen after witnessing death?",opts:["Hippogriff","Phoenix","Thestral","Basilisk"],a:2},
+  {q:"Which potion grants good luck?",opts:["Veritaserum","Polyjuice","Felix Felicis","Amortentia"],a:2},
+  {q:"Who destroyed the diary Horcrux?",opts:["Ron","Dumbledore","Harry","Hermione"],a:2},
+  {q:"Which character can transform into a cat?",opts:["Snape","Dumbledore","McGonagall","Lupin"],a:2},
+  {q:"What creature does Hagrid hatch from an egg?",opts:["Hippogriff","Phoenix","Basilisk","Norwegian Ridgeback dragon"],a:3},
+  {q:"What is the wizarding prison called?",opts:["Nurmengard","Ministry","Azkaban","Durmstrang"],a:2},
+  {q:"Who betrayed Harry's parents as secret keeper?",opts:["Sirius Black","Remus Lupin","Peter Pettigrew","Severus Snape"],a:2},
+  {q:"What is the final Triwizard Tournament task?",opts:["Dragon fighting","Underwater rescue","A maze","A duel"],a:2},
+  {q:"What is the name of Ron's pet rat?",opts:["Crookshanks","Hedwig","Scabbers","Trevor"],a:2},
+  {q:"Who teaches DADA in Harry's fifth year?",opts:["Lupin","Mad-Eye Moody","Snape","Umbridge"],a:3},
+  {q:"What is Neville's pet toad called?",opts:["Scabbers","Hedwig","Crookshanks","Trevor"],a:3},
+  {q:"Which house did the Sorting Hat consider for Harry?",opts:["Ravenclaw","Hufflepuff","Slytherin","Gryffindor"],a:2},
+  {q:"Which teams play the Quidditch World Cup in book 4?",opts:["England vs France","Ireland vs Bulgaria","Scotland vs Germany","Wales vs Romania"],a:1},
+  {q:"What is Dumbledore's phoenix called?",opts:["Hedwig","Buckbeak","Fawkes","Norbert"],a:2},
+  {q:"Which ghost haunts the girls' bathroom?",opts:["Nearly Headless Nick","Bloody Baron","Peeves","Moaning Myrtle"],a:3}
+],
+starwars:[
+  {q:"Darth Vader's real name?",opts:["Luke Skywalker","Han Solo","Anakin Skywalker","Obi-Wan Kenobi"],a:2,d:1},
+  {q:"Yoda's lightsaber color?",opts:["Blue","Red","Purple","Green"],a:3,d:1},
+  {q:"Han Solo's ship?",opts:["X-Wing","TIE Fighter","Millennium Falcon","Star Destroyer"],a:2,d:1},
+  {q:"Planet destroyed by Death Star?",opts:["Tatooine","Alderaan","Naboo","Hoth"],a:1,d:1},
+  {q:"Chewbacca is which species?",opts:["Ewok","Wookiee","Gungan","Jawa"],a:1,d:1},
+  {q:"Episode V subtitle?",opts:["A New Hope","The Empire Strikes Back","Return of the Jedi","The Phantom Menace"],a:1,d:1},
+  {q:"Who trained Luke Skywalker?",opts:["Mace Windu","Qui-Gon Jinn","Obi-Wan & Yoda","Count Dooku"],a:2,d:1},
+  {q:"Color of Mace Windu's lightsaber?",opts:["Green","Blue","Red","Purple"],a:3,d:1},
+  {q:"Bounty hunter who captured Han Solo?",opts:["Greedo","Boba Fett","Jango Fett","Bossk"],a:1,d:1},
+  {q:"What are the evil Sith known for?",opts:["Blue lightsabers","Force healing","Rule of Two","Jedi Council"],a:2,d:2},
+  {q:"Which planet is Luke from?",opts:["Naboo","Coruscant","Tatooine","Dagobah"],a:2,d:2},
+  {q:"Who is Rey's grandfather?",opts:["Obi-Wan","Luke","Han Solo","Palpatine"],a:3,d:2},
+  {q:"What species is Jabba?",opts:["Hutt","Rodian","Twi'lek","Wookiee"],a:0,d:2},
+  {q:"Who said \"Do or do not, there is no try\"?",opts:["Obi-Wan","Luke","Yoda","Mace Windu"],a:2,d:2},
+  {q:"What is the Jedi weapon?",opts:["Blaster","Lightsaber","Bowcaster","Vibroblade"],a:1,d:2},
+  {q:"Who killed Han Solo?",opts:["Boba Fett","Snoke","Kylo Ren","Palpatine"],a:2,d:2},
+  {q:"The Clone Army was based on which bounty hunter?",opts:["Boba Fett","Cad Bane","Jango Fett","Bossk"],a:2,d:2},
+  {q:"What is Baby Yoda's actual name?",opts:["Yaddle","Grogu","Yodel","Grog"],a:1,d:2},
+  {q:"Which droid carries the Death Star plans?",opts:["C-3PO","BB-8","R2-D2","K-2SO"],a:2,d:3},
+  {q:"Darth Sidious is also known as?",opts:["Dooku","Maul","Palpatine","Snoke"],a:2,d:3},
+  {q:"The forest moon of Endor is home to?",opts:["Jawas","Ewoks","Gungans","Wookiees"],a:1,d:3},
+  {q:"What color is a Sith lightsaber?",opts:["Blue","Green","Red","Yellow"],a:2,d:3},
+  {q:"Who froze Han Solo in carbonite?",opts:["Jabba","Boba Fett","Darth Vader","Lando"],a:2,d:3},
+  {q:"Princess Leia is from which planet?",opts:["Coruscant","Naboo","Alderaan","Bespin"],a:2,d:3},
+  {q:"What type of trooper wears white armor?",opts:["Clone trooper","Stormtrooper","Death trooper","Scout trooper"],a:1,d:3},
+  {q:"Which ship made the Kessel Run in 12 parsecs?",opts:["X-Wing","Slave I","Millennium Falcon","Naboo Starfighter"],a:2,d:3},
+  {q:"What is the name of Kylo Ren's real name?",opts:["Anakin Solo","Ben Solo","Luke Solo","Han Solo Jr"],a:1},
+  {q:"Which planet is home to the Wookiees?",opts:["Endor","Tatooine","Kashyyyk","Naboo"],a:2},
+  {q:"What is the name of Boba Fett's ship?",opts:["Slave I","Razor Crest","Ebon Hawk","Outrider"],a:0},
+  {q:"Who composed the Star Wars music?",opts:["Hans Zimmer","Howard Shore","John Williams","James Horner"],a:2},
+  {q:"Which order did Palpatine give to destroy the Jedi?",opts:["Order 65","Order 66","Order 67","Order 99"],a:1},
+  {q:"Who is Luke Skywalker's twin sister?",opts:["Padmé","Rey","Leia","Ahsoka"],a:2},
+  {q:"Which Sith has a double-bladed lightsaber?",opts:["Count Dooku","Kylo Ren","Darth Maul","Grievous"],a:2},
+  {q:"What type of armor does Boba Fett wear?",opts:["Stormtrooper","Clone","Mandalorian","Jedi"],a:2},
+  {q:"Which Death Star was destroyed first?",opts:["Death Star II","Death Star I","Starkiller Base","Death Star III"],a:1},
+  {q:"Who is Anakin Skywalker's mother?",opts:["Padmé","Leia","Shmi","Breha"],a:2},
+  {q:"What is Count Dooku's Sith name?",opts:["Darth Vader","Darth Maul","Darth Tyranus","Darth Sidious"],a:2},
+  {q:"What creature lives in the Death Star trash compactor?",opts:["Rancor","Sarlacc","Dianoga","Wampa"],a:2},
+  {q:"Who leads the Separatists in the Clone Wars?",opts:["Palpatine","Grievous","Jango Fett","Count Dooku"],a:3},
+  {q:"What is the Mandalorian's ship in the TV series?",opts:["Slave I","Razor Crest","Ghost","Ebon Hawk"],a:1},
+  {q:"Which ice planet has the Rebel base in Episode V?",opts:["Tatooine","Endor","Mustafar","Hoth"],a:3},
+  {q:"Who trained Anakin Skywalker as a Jedi?",opts:["Yoda","Mace Windu","Qui-Gon Jinn","Obi-Wan Kenobi"],a:3},
+  {q:"Where does the final battle of Episode I take place?",opts:["Coruscant","Tatooine","Naboo","Kamino"],a:2},
+  {q:"What makes Kylo Ren's lightsaber unique?",opts:["Double blade","Curved hilt","Crossguard","Purple color"],a:2},
+  {q:"What planet does Yoda live on in exile?",opts:["Hoth","Dagobah","Naboo","Endor"],a:1},
+  {q:"TIE fighters are named after what?",opts:["Turbo Ion Engine","Twin Ion Engine","Tactical Ion Engine","Total Ion Engine"],a:1},
+  {q:"Who is supreme leader of the First Order before Kylo?",opts:["Palpatine","Hux","Phasma","Snoke"],a:3},
+  {q:"What species is Admiral Ackbar?",opts:["Human","Gungan","Mon Calamari","Rodian"],a:2},
+  {q:"What did Admiral Ackbar famously say?",opts:["Fire!","Retreat!","It's a trap!","Attack!"],a:2},
+  {q:"What is the capital planet of the Republic?",opts:["Naboo","Tatooine","Coruscant","Alderaan"],a:2}
+],
+lotr:[
+  {q:"Who carries the One Ring to Mordor?",opts:["Aragorn","Gandalf","Frodo","Legolas"],a:2,d:1},
+  {q:"Gandalf's horse?",opts:["Asfaloth","Shadowfax","Bill the Pony","Roheryn"],a:1,d:1},
+  {q:"How many rings for the Elven-kings?",opts:["1","3","7","9"],a:1,d:1},
+  {q:"What is Gollum's real name?",opts:["Bilbo","Déagol","Sméagol","Faramir"],a:2,d:1},
+  {q:"Legolas is which race?",opts:["Human","Dwarf","Elf","Hobbit"],a:2,d:1},
+  {q:"What is the name of Aragorn's sword?",opts:["Glamdring","Sting","Andúril","Orcrist"],a:2,d:1},
+  {q:"Who says \"You shall not pass\"?",opts:["Aragorn","Gandalf","Elrond","Saruman"],a:1,d:1},
+  {q:"Mordor's volcanic mountain?",opts:["Minas Tirith","Mount Doom","Weathertop","Isengard"],a:1,d:1},
+  {q:"How many members in the Fellowship?",opts:["7","8","9","10"],a:2,d:1},
+  {q:"Who kills the Witch-king?",opts:["Gandalf","Aragorn","Éowyn","Legolas"],a:2,d:2},
+  {q:"What is the Shire?",opts:["An Elven city","Hobbit homeland","Dwarf mines","A human kingdom"],a:1,d:2},
+  {q:"Who created the One Ring?",opts:["Morgoth","Saruman","Sauron","Celebrimbor"],a:2,d:2},
+  {q:"Gimli is which race?",opts:["Elf","Hobbit","Human","Dwarf"],a:3,d:2},
+  {q:"What gift does Galadriel give Frodo?",opts:["A sword","A light","A cloak","A shield"],a:1,d:2},
+  {q:"Who is the king of Rohan?",opts:["Denethor","Théoden","Faramir","Elrond"],a:1,d:2},
+  {q:"Bilbo's sword is called?",opts:["Glamdring","Orcrist","Sting","Andúril"],a:2,d:2},
+  {q:"Which tower does Saruman live in?",opts:["Barad-dûr","Minas Tirith","Orthanc","Minas Morgul"],a:2,d:2},
+  {q:"What creature does Gandalf fight in Moria?",opts:["Dragon","Troll","Balrog","Warg"],a:2,d:2},
+  {q:"Sam's full first name is?",opts:["Samuel","Samwell","Samwise","Sampson"],a:2,d:3},
+  {q:"How many rings were made for mortal men?",opts:["3","5","7","9"],a:3,d:3},
+  {q:"Who destroys the One Ring?",opts:["Frodo","Sam","Gollum","Aragorn"],a:2,d:3},
+  {q:"What is Legolas's weapon of choice?",opts:["Sword","Axe","Bow","Spear"],a:2,d:3},
+  {q:"Which city is the capital of Gondor?",opts:["Edoras","Rivendell","Minas Tirith","Osgiliath"],a:2,d:3},
+  {q:"What does the Eye of Sauron sit atop?",opts:["Mount Doom","Barad-dûr","Orthanc","Minas Morgul"],a:1,d:3},
+  {q:"Who says \"My precious\"?",opts:["Frodo","Bilbo","Sauron","Gollum"],a:3,d:3},
+  {q:"What are the tree creatures called?",opts:["Elves","Orcs","Ents","Wargs"],a:2,d:3},
+  {q:"What race is Aragorn?",opts:["Elf","Dwarf","Hobbit","Human"],a:3},
+  {q:"What is the name of the spider in Return of the King?",opts:["Ungoliant","Shelob","Arachne","Mirkwood"],a:1},
+  {q:"Which Hobbit is also known as Strider's companion?",opts:["Merry","Pippin","Sam","Frodo"],a:3},
+  {q:"What are the Nazgûl also known as?",opts:["Dark Elves","Ringwraiths","Uruk-hai","Balrogs"],a:1},
+  {q:"Who is the Lady of Lothlórien?",opts:["Arwen","Éowyn","Galadriel","Tauriel"],a:2},
+  {q:"What is the name of Gandalf's sword?",opts:["Sting","Andúril","Glamdring","Narsil"],a:2},
+  {q:"Who is the steward of Gondor in Return of the King?",opts:["Boromir","Faramir","Denethor","Théoden"],a:2},
+  {q:"What is Aragorn's elvish name?",opts:["Strider","Thorongil","Elessar","Isildur"],a:2},
+  {q:"Which hobbit becomes Thain of the Shire?",opts:["Frodo","Sam","Merry","Pippin"],a:3},
+  {q:"What is the fortress at Helm's Deep called?",opts:["Minas Tirith","Isengard","The Hornburg","Edoras"],a:2},
+  {q:"What is Gandalf's Elvish name?",opts:["Olórin","Saruman","Mithrandir","Radagast"],a:2},
+  {q:"Who is the father of Arwen?",opts:["Celeborn","Thranduil","Galadriel","Elrond"],a:3},
+  {q:"What is Aragorn's ranger title?",opts:["Dúnadan","Strider","Elessar","Thorongil"],a:1},
+  {q:"Who is Boromir's brother?",opts:["Théoden","Éomer","Faramir","Aragorn"],a:2},
+  {q:"What mountain pass does the Fellowship attempt before Moria?",opts:["Mount Doom","Caradhras","Weathertop","Amon Hen"],a:1},
+  {q:"The Witch-king is the leader of which group?",opts:["Orcs","The Nazgûl","Uruk-hai","Trolls"],a:1},
+  {q:"What was Sam's profession before the quest?",opts:["Baker","Blacksmith","Gardener","Farmer"],a:2},
+  {q:"What does Gandalf become after defeating the Balrog?",opts:["Gandalf the Red","Gandalf the White","Gandalf the Gold","Gandalf the Silver"],a:1},
+  {q:"What river does the Fellowship travel after Lothlórien?",opts:["Brandywine","Isen","Anduin","Bruinen"],a:2},
+  {q:"What is the name of the inn at Bree?",opts:["The Golden Hall","The Prancing Pony","The Green Dragon","The Ivy Bush"],a:1},
+  {q:"What is a palantír?",opts:["A ring","A sword","A seeing stone","A map"],a:2},
+  {q:"Which wizard is known as the Brown?",opts:["Gandalf","Saruman","Radagast","Alatar"],a:2},
+  {q:"What is the Black Gate the entrance to?",opts:["Rohan","Isengard","The Shire","Mordor"],a:3},
+  {q:"What army aids Gondor at Pelennor Fields?",opts:["Elves","Dwarves","Rohirrim","Eagles"],a:2}
+],
+got:[
+  {q:"Motto of House Stark?",opts:["Fire and Blood","Ours is the Fury","Winter is Coming","We Do Not Sow"],a:2,d:1},
+  {q:"Who sits on the Iron Throne at the start?",opts:["Joffrey Baratheon","Robert Baratheon","Cersei Lannister","Ned Stark"],a:1,d:1},
+  {q:"Who killed Joffrey Baratheon?",opts:["Tyrion Lannister","Olenna Tyrell","Sansa Stark","Littlefinger"],a:1,d:1},
+  {q:"Name of Arya Stark's sword?",opts:["Longclaw","Needle","Ice","Oathkeeper"],a:1,d:1},
+  {q:"Which episode is known as The Red Wedding?",opts:["S2E9","S3E7","S3E9","S4E2"],a:2,d:1},
+  {q:"Who is Jon Snow's biological father?",opts:["Ned Stark","Robert Baratheon","Rhaegar Targaryen","Stannis Baratheon"],a:2,d:1},
+  {q:"Name of the castle at the Wall?",opts:["Winterfell","Castle Black","Hardhome","Eastwatch"],a:1,d:1},
+  {q:"Who plays Tyrion Lannister?",opts:["Kit Harington","Nikolaj Coster-Waldau","Peter Dinklage","Liam Cunningham"],a:2,d:1},
+  {q:"What does Valar Morghulis mean?",opts:["Fire and Blood","All men must die","Night gathers","What is dead may never die"],a:1,d:1},
+  {q:"What are Daenerys's three dragons called?",opts:["Smaug, Fafnir, Glaurung","Drogon, Rhaegal, Viserion","Balerion, Vhagar, Meraxes","Jon, Aegon, Aemon"],a:1,d:2},
+  {q:"Which family rules Casterly Rock?",opts:["Stark","Tyrell","Baratheon","Lannister"],a:3,d:2},
+  {q:"What is the Wall made of?",opts:["Stone","Wood","Ice","Steel"],a:2,d:2},
+  {q:"Who is Hodor?",opts:["A knight","Bran's carrier","A wildling","A Maester"],a:1,d:2},
+  {q:"Daenerys is also known as?",opts:["The Red Woman","Mother of Dragons","Queen of Thorns","Lady Stoneheart"],a:1,d:2},
+  {q:"Which city is across the Narrow Sea?",opts:["Pentos","Winterfell","King's Landing","Oldtown"],a:0,d:2},
+  {q:"What creatures are north of the Wall?",opts:["Dragons","Giants only","White Walkers","Direwolves only"],a:2,d:2},
+  {q:"Jon Snow's direwolf is named?",opts:["Grey Wind","Summer","Nymeria","Ghost"],a:3,d:2},
+  {q:"Who pushes Bran from the tower?",opts:["Cersei","The Hound","Jaime","Joffrey"],a:2,d:2},
+  {q:"Motto of House Lannister?",opts:["Ours is the Fury","Growing Strong","Hear Me Roar","Fire and Blood"],a:2,d:3},
+  {q:"Which character has a face-changing ability?",opts:["Sansa","Arya","Bran","Cersei"],a:1,d:3},
+  {q:"What is wildfire?",opts:["A dragon","A green explosive","A sword","A poison"],a:1,d:3},
+  {q:"Who rules the Iron Islands?",opts:["Boltons","Greyjoys","Martells","Tarlys"],a:1,d:3},
+  {q:"The Night King is the leader of?",opts:["The Wildlings","The Dothraki","The White Walkers","The Ironborn"],a:2,d:3},
+  {q:"What does Bran become by the end?",opts:["King","Hand of the King","Night's Watch","Maester"],a:0,d:3},
+  {q:"Who forged Arya's weapon in Season 8?",opts:["Tywin","The Hound","Gendry","Davos"],a:2,d:3},
+  {q:"Which house has a rose as its sigil?",opts:["Martell","Tully","Tyrell","Arryn"],a:2,d:3},
+  {q:"What is the name of the Stark family direwolf mother?",opts:["Ghost","Lady","Nymeria","Grey Wind"],a:1},
+  {q:"Which city is the capital of the Seven Kingdoms?",opts:["Winterfell","Dragonstone","King's Landing","Oldtown"],a:2},
+  {q:"What is Tyrion's famous quote about knowledge?",opts:["Knowledge is power","A mind needs books","I drink and I know things","Words are wind"],a:2},
+  {q:"Who is known as the King Slayer?",opts:["Ned Stark","Robert Baratheon","Jaime Lannister","The Hound"],a:2},
+  {q:"What material can kill White Walkers?",opts:["Steel","Gold","Dragonglass","Iron"],a:2},
+  {q:"What organization does Jon Snow join?",opts:["The Kingsguard","The Night's Watch","The Faceless Men","The Maesters"],a:1},
+  {q:"Who killed the Night King?",opts:["Jon Snow","Daenerys","The Hound","Arya"],a:3},
+  {q:"What is the name of the Red Priestess?",opts:["Cersei","Olenna","Melisandre","Margaery"],a:2},
+  {q:"What is the massive ice structure in the North called?",opts:["The Gate","The Wall","The Barrier","The Shield"],a:1},
+  {q:"What is Samwell Tarly's nickname?",opts:["Little Sam","Sam the Slayer","Sam the Brave","Big Sam"],a:1},
+  {q:"What poison was used to kill Joffrey?",opts:["Wolfsbane","Tears of Lys","The Strangler","Nightshade"],a:2},
+  {q:"Who is Jon Snow's mother?",opts:["Cersei","Sansa","Lyanna Stark","Catelyn"],a:2},
+  {q:"What is the ancestral sword of House Stark?",opts:["Longclaw","Needle","Oathkeeper","Ice"],a:3},
+  {q:"What city does Daenerys free in Slaver's Bay?",opts:["Braavos","Volantis","Meereen","Pentos"],a:2},
+  {q:"Which character is known as The Spider?",opts:["Littlefinger","Bronn","Varys","The Hound"],a:2},
+  {q:"Who trained Arya in sword fighting in King's Landing?",opts:["The Hound","Jaqen","Brienne","Syrio Forel"],a:3},
+  {q:"What is the name of Cersei's zombie bodyguard?",opts:["The Hound","Bronn","Hodor","The Mountain"],a:3},
+  {q:"What type of creature is Nymeria?",opts:["Dragon","Horse","Raven","Direwolf"],a:3},
+  {q:"Who says Shame while ringing a bell?",opts:["Cersei","Septa Unella","The High Sparrow","Melisandre"],a:1},
+  {q:"What is the seat of House Tyrell?",opts:["Casterly Rock","Highgarden","Storm's End","Dragonstone"],a:1},
+  {q:"What does Valar Dohaeris mean?",opts:["All men must die","All men must serve","No one is safe","Winter is here"],a:1},
+  {q:"What does The Hound fear?",opts:["Swords","Fire","Water","Magic"],a:1},
+  {q:"What is Littlefinger's real name?",opts:["Varys","Bronn","Petyr Baelish","Theon"],a:2},
+  {q:"Which Stark direwolf is killed first?",opts:["Ghost","Nymeria","Grey Wind","Lady"],a:3},
+  {q:"Who is known as the Onion Knight?",opts:["Bronn","Davos Seaworth","Jorah","Thoros"],a:1}
+],
+breakingbad:[
+  {q:"Walter White's alias?",opts:["The Cook","El Diablo","Heisenberg","Señor Blanco"],a:2,d:1},
+  {q:"Subject Walter White teaches?",opts:["Biology","Chemistry","Physics","Maths"],a:1,d:1},
+  {q:"Color of Walter's famous meth?",opts:["White","Yellow","Blue","Clear"],a:2,d:1},
+  {q:"Fast food chain Gus Fring owns?",opts:["Taco Sal","Los Pollos Hermanos","Salamancas","Madrigals"],a:1,d:1},
+  {q:"Saul Goodman's real name?",opts:["James McGill","Howard Hamlin","Chuck McGill","Kim Wexler"],a:0,d:1},
+  {q:"Main antagonist of season 4?",opts:["Tuco Salamanca","Juan Bolsa","Gus Fring","Don Eladio"],a:2,d:1},
+  {q:"What car does Walt buy himself as a treat?",opts:["Pontiac Aztek","Chrysler 300","Dodge Challenger","BMW 3 Series"],a:2,d:1},
+  {q:"How many seasons does Breaking Bad have?",opts:["4","5","6","7"],a:1,d:1},
+  {q:"Jesse Pinkman's partner killed early on?",opts:["Combo","Badger","Emilio","Skinny Pete"],a:2,d:1},
+  {q:"What is the name of Walter's lawyer?",opts:["Mike Ehrmantraut","Saul Goodman","Hector Salamanca","Gale Boetticher"],a:1,d:2},
+  {q:"What is Walter's wife's name?",opts:["Marie","Skyler","Jane","Lydia"],a:1,d:2},
+  {q:"Hank Schrader works for which agency?",opts:["FBI","CIA","DEA","ATF"],a:2,d:2},
+  {q:"What is the RV used for?",opts:["Living","Cooking meth","Storage","Surveillance"],a:1,d:2},
+  {q:"Jesse often says which word?",opts:["Dude","Bro","Yo","Man"],a:2,d:2},
+  {q:"What state is the show set in?",opts:["Arizona","Texas","Nevada","New Mexico"],a:3,d:2},
+  {q:"Who runs the car wash?",opts:["Jesse","Skyler","Walt Jr.","Walter"],a:3,d:2},
+  {q:"What disability does Walt Jr. have?",opts:["Blindness","Deafness","Cerebral palsy","Autism"],a:2,d:2},
+  {q:"Gus Fring dies from a?",opts:["Gunshot","Poison","Bomb","Stabbing"],a:2,d:2},
+  {q:"What does the Lily of the Valley symbolize?",opts:["Death","Walt poisoned Brock","Jesse's innocence","Gus's revenge"],a:1,d:3},
+  {q:"Where does Hank find evidence against Walt?",opts:["The car wash","Walt's lab","The bathroom","Jesse's house"],a:2,d:3},
+  {q:"What is Mike's profession?",opts:["Lawyer","Fixer/hitman","Accountant","Chemist"],a:1,d:3},
+  {q:"Todd works for which group?",opts:["Cartel","DEA","Neo-Nazis","Madrigal"],a:2,d:3},
+  {q:"What does Walter say \"I am\" in the final season?",opts:["The cook","The danger","The one who knocks","Heisenberg"],a:2,d:3},
+  {q:"What happens to Jesse at the end?",opts:["He dies","He goes to prison","He escapes","He takes over"],a:2,d:3},
+  {q:"Walter's cancer affects which organ?",opts:["Brain","Liver","Lungs","Stomach"],a:2,d:3},
+  {q:"What element symbol represents the show?",opts:["Br & Ba","He & Br","W & W","Cr & Ys"],a:0,d:3},
+  {q:"What is the name of Walter's son?",opts:["Jesse","Hank","Walter Jr","Mike"],a:2},
+  {q:"In which desert is most of the show set?",opts:["Mojave","Sonoran","Chihuahuan","Painted"],a:2},
+  {q:"What does Walter teach at the start of the show?",opts:["Math","Biology","Chemistry","Physics"],a:2},
+  {q:"Who says \"I am the one who knocks\"?",opts:["Jesse","Gus","Hank","Walter"],a:3},
+  {q:"What is the name of the car wash the Whites buy?",opts:["A1A Car Wash","Crystal Clean","Bogdan's Car Wash","White Wash"],a:0},
+  {q:"What is Gus Fring's country of origin?",opts:["Mexico","Colombia","Chile","Brazil"],a:2},
+  {q:"How does Hector Salamanca communicate?",opts:["Sign language","Writing","A bell","Morse code"],a:2},
+  {q:"What vehicle does Walter famously drive?",opts:["A truck","A Pontiac Aztek","A minivan","A Camaro"],a:1},
+  {q:"What falls from the sky in the Season 2 finale?",opts:["A helicopter","Hail","Plane debris","A satellite"],a:2},
+  {q:"Which of Jesse's girlfriends dies from an overdose?",opts:["Wendy","Andrea","Jane","Lydia"],a:2},
+  {q:"What does Walter use to dissolve bodies?",opts:["Bleach","Sulfuric acid","Hydrofluoric acid","Lye"],a:2},
+  {q:"What is the name of the final episode?",opts:["Ozymandias","Granite State","Felina","Full Measure"],a:2},
+  {q:"What is Todd's uncle's name?",opts:["Hank","Tuco","Jack","Gus"],a:2},
+  {q:"What book links Walt to Heisenberg?",opts:["A chemistry textbook","A diary","Leaves of Grass","A lab notebook"],a:2},
+  {q:"What is the bottle episode about an insect called?",opts:["Bug","Pest","Fly","Crawl"],a:2},
+  {q:"What is Walter's daughter's name?",opts:["Marie","Skyler","Holly","Jane"],a:2},
+  {q:"Who is Walter's brother-in-law?",opts:["Jesse","Saul","Hank","Mike"],a:2},
+  {q:"What fake name does Walter use while hiding?",opts:["Heisenberg","Mr. Lambert","Mr. White","Mr. Fring"],a:1},
+  {q:"Which state does Walter flee to?",opts:["California","Colorado","New Hampshire","Montana"],a:2},
+  {q:"Skinny Pete surprisingly plays what instrument well?",opts:["Guitar","Drums","Piano","Violin"],a:2},
+  {q:"Who says I am the danger?",opts:["Jesse","Hank","Gus","Walter"],a:3},
+  {q:"What car does Walter buy his son?",opts:["Pontiac","Toyota","Mustang","Dodge Challenger"],a:3},
+  {q:"What is Walter Jr. frequently seen doing?",opts:["Studying","Playing games","Eating breakfast","Swimming"],a:2},
+  {q:"Where does Walter bury his money?",opts:["The car wash","Under his house","The desert","A storage unit"],a:2}
+],
+anime:[
+  {q:"What is the name of the main character in Naruto?",opts:["Sasuke Uchiha","Naruto Uzumaki","Kakashi Hatake","Sakura Haruno"],a:1},
+  {q:"In Dragon Ball Z, what is Goku's Saiyan name?",opts:["Vegeta","Kakarot","Broly","Raditz"],a:1},
+  {q:"Which anime features a notebook that kills?",opts:["Tokyo Ghoul","Death Note","Parasyte","Psycho-Pass"],a:1},
+  {q:"Who is the captain of the Straw Hat Pirates?",opts:["Zoro","Sanji","Luffy","Nami"],a:2},
+  {q:"What is the name of the titan Eren can transform into?",opts:["Colossal Titan","Armored Titan","Attack Titan","Beast Titan"],a:2},
+  {q:"Which anime is set in a world of quirks and heroes?",opts:["One Punch Man","My Hero Academia","Mob Psycho 100","Tiger & Bunny"],a:1},
+  {q:"In Demon Slayer, what is Tanjiro's breathing style?",opts:["Flame Breathing","Thunder Breathing","Water Breathing","Wind Breathing"],a:2},
+  {q:"What sport does the anime Haikyuu!! focus on?",opts:["Basketball","Soccer","Volleyball","Tennis"],a:2},
+  {q:"Who is the strongest hero in One Punch Man?",opts:["Genos","Bang","Saitama","Tatsumaki"],a:2},
+  {q:"In Fullmetal Alchemist, what did Edward lose?",opts:["His eyes","His arm and leg","His voice","His memory"],a:1},
+  {q:"Which anime features the character L as a detective?",opts:["Monster","Psycho-Pass","Death Note","Detective Conan"],a:2},
+  {q:"What is Pikachu's type in Pokémon?",opts:["Fire","Water","Electric","Normal"],a:2},
+  {q:"In Jujutsu Kaisen, what is Gojo's first name?",opts:["Yuji","Megumi","Satoru","Toge"],a:2},
+  {q:"Which anime takes place aboard a ship called the Bebop?",opts:["Trigun","Cowboy Bebop","Outlaw Star","Space Dandy"],a:1},
+  {q:"What is the name of the virtual world in Sword Art Online?",opts:["Alfheim","Aincrad","Underworld","GGO"],a:1},
+  {q:"In Bleach, what is Ichigo's main weapon called?",opts:["Bankai","Zangetsu","Senbonzakura","Hyorinmaru"],a:1},
+  {q:"Which anime features a boy who becomes a Shinigami?",opts:["Naruto","Bleach","Blue Exorcist","Soul Eater"],a:1},
+  {q:"In One Piece, what is the treasure everyone seeks?",opts:["Grand Line","All Blue","One Piece","Devil Fruit"],a:2},
+  {q:"What studio made Spirited Away?",opts:["Toei","Madhouse","Studio Ghibli","Sunrise"],a:2},
+  {q:"In Hunter x Hunter, what is the power system called?",opts:["Chakra","Ki","Nen","Haki"],a:2},
+  {q:"Which anime features Survey Corps fighting Titans?",opts:["Kabaneri","God Eater","Attack on Titan","Darling in the Franxx"],a:2},
+  {q:"What is Gon's last name in Hunter x Hunter?",opts:["Zoldyck","Freecss","Paradinight","Nostrade"],a:1},
+  {q:"In Spy x Family, what is Anya's secret ability?",opts:["Super strength","Telepathy","Invisibility","Time travel"],a:1},
+  {q:"Which anime is about a genius high schooler who finds a death notebook?",opts:["Code Geass","Death Note","Classroom of the Elite","Terror in Resonance"],a:1},
+  {q:"What is the name of Vegeta's signature attack?",opts:["Kamehameha","Spirit Bomb","Galick Gun","Destructo Disc"],a:2},
+  {q:"Who was the first member to officially join Luffy's crew?",opts:["Zoro","Nami","Usopp","Sanji"],a:0},
+  {q:"What reindeer doctor ate the Human-Human Fruit?",opts:["Bepo","Tony Tony Chopper","Kung-Fu Dugong","Laboon"],a:1},
+  {q:"Which is NOT one of the three types of Haki?",opts:["Observation","Armament","Conqueror's","Elemental"],a:3},
+  {q:"What is the name of the skeletal musician in the Straw Hats?",opts:["Moria","Ryuma","Brook","Yorki"],a:2},
+  {q:"Nico Robin's Hana Hana no Mi lets her do what?",opts:["Control plants","Turn into a flower","Sprout body parts on any surface","Breathe underwater"],a:2},
+  {q:"What was Luffy's bounty after the Enies Lobby arc?",opts:["30 million","100 million","300 million","500 million"],a:2},
+  {q:"What is the name of the demon fox sealed inside Naruto?",opts:["Shukaku","Kurama","Matatabi","Gyuki"],a:1},
+  {q:"Who was the teacher of Team 7?",opts:["Jiraiya","Iruka","Kakashi","Orochimaru"],a:2},
+  {q:"Which Uchiha member massacred his own clan?",opts:["Madara","Obito","Itachi","Shisui"],a:2},
+  {q:"What technique lets Naruto create thousands of copies?",opts:["Rasengan","Multi-Shadow Clone Jutsu","Chidori","Substitution Jutsu"],a:1},
+  {q:"Who was the Fifth Hokage of the Hidden Leaf Village?",opts:["Minato","Hiruzen","Tsunade","Danzo"],a:2},
+  {q:"What organization wears black cloaks with red clouds?",opts:["The Seven Swordsmen","Akatsuki","Kara","Root"],a:1},
+  {q:"What planet is Goku originally from?",opts:["Planet Namek","Planet Vegeta","Planet Earth","Planet Frieza"],a:1},
+  {q:"How many Dragon Balls are needed to summon Shenron?",opts:["5","6","7","10"],a:2},
+  {q:"Who killed Frieza for the first time on Earth?",opts:["Goku","Vegeta","Future Trunks","Gohan"],a:2},
+  {q:"What is the Fusion Dance fusion of Goku and Vegeta called?",opts:["Vegito","Gogeta","Gotenks","Goketa"],a:1},
+  {q:"Which character uses the Special Beam Cannon technique?",opts:["Piccolo","Krillin","Tien","Yamcha"],a:0},
+  {q:"In the Cell Saga, who first reached Super Saiyan 2?",opts:["Goku","Vegeta","Gohan","Future Trunks"],a:2},
+  {q:"What is the name of the outermost wall protecting humanity?",opts:["Wall Maria","Wall Rose","Wall Sina","Wall Sheena"],a:0},
+  {q:"What is Eren Jaeger's Titan form called?",opts:["Colossal Titan","Armored Titan","Attack Titan","Beast Titan"],a:2},
+  {q:"Who is known as Humanity's Strongest Soldier?",opts:["Erwin Smith","Levi Ackerman","Mikasa Ackerman","Reiner Braun"],a:1},
+  {q:"What elite military branch goes outside the walls?",opts:["Military Police","Garrison Regiment","Scout Regiment","Trainee Corps"],a:2},
+  {q:"How did Grisha pass his Titan powers to Eren?",opts:["Blood transfusion","Eren ate him as a mindless Titan","A magical ritual","Eren was born with them"],a:1},
+  {q:"Which character is revealed to be the Female Titan?",opts:["Christa","Sasha","Annie","Ymir"],a:2},
+  {q:"What is the name of Ichigo Kurosaki's Zanpakuto?",opts:["Zabimaru","Senbonzakura","Zangetsu","Hyorinmaru"],a:2},
+  {q:"What is the home of the Soul Reapers called?",opts:["Hueco Mundo","Soul Society","The Quincy Kingdom","Karakura Town"],a:1},
+  {q:"What is the final upgraded form of a Zanpakuto called?",opts:["Shikai","Bankai","Resurrección","Vollständig"],a:1},
+  {q:"Who betrayed Soul Society to create the Arrancars?",opts:["Gin Ichimaru","Sosuke Aizen","Kaname Tosen","Grimmjow"],a:1},
+  {q:"What are Soul Reapers with Hollow powers called?",opts:["Espada","Visored","Quincy","Fullbringers"],a:1},
+  {q:"Which squad did Shunsui Kyoraku lead at the start of the series?",opts:["Squad 6","Squad 8","Squad 11","Squad 13"],a:1}
+],
+pokemon:[
+  {q:"Which Gen 1 starter is dual-type in its first evolution?",opts:["Charmander","Squirtle","Bulbasaur (Grass/Poison)","Pikachu"],a:2},
+  {q:"What Saffron City building did Team Rocket take over?",opts:["Pokémon Tower","Silph Co.","The Power Plant","Cinnabar Lab"],a:1},
+  {q:"Which type was broken in Gen 1 with no real weaknesses?",opts:["Dragon","Psychic","Fighting","Normal"],a:1},
+  {q:"Which legendary bird is found in the Seafoam Islands?",opts:["Zapdos","Moltres","Articuno","Ho-Oh"],a:2},
+  {q:"What item wakes up the Snorlax blocking the route?",opts:["Silph Scope","Poké Flute","Bicycle","Old Rod"],a:1},
+  {q:"Which Pokémon is #151 in the original Kanto Pokédex?",opts:["Dragonite","Mew","Mewtwo","Togepi"],a:1},
+  {q:"Which Poké Ball catches Pokémon that flee easily?",opts:["Lure Ball","Fast Ball","Friend Ball","Heavy Ball"],a:1},
+  {q:"Which Gym Leader has a devastating Miltank?",opts:["Jasmine","Whitney","Clair","Erika"],a:1},
+  {q:"Which Pokémon needs a King's Rock to evolve?",opts:["Scyther","Slowpoke into Slowking","Onix","Seadra"],a:1},
+  {q:"How many badges total in Johto and Kanto combined?",opts:["8","12","16","20"],a:2},
+  {q:"Which legendary was the mascot for Pokémon Crystal?",opts:["Lugia","Entei","Suicune","Celebi"],a:2},
+  {q:"What color is the Shiny Gyarados at Lake of Rage?",opts:["Blue","Red","Gold","Green"],a:1},
+  {q:"Which team wants to expand the landmass in Ruby/Sapphire?",opts:["Team Aqua","Team Magma","Team Galactic","Team Flare"],a:1},
+  {q:"Which Pokémon has 1 HP but Wonder Guard ability?",opts:["Ninjask","Shedinja","Sableye","Mawile"],a:1},
+  {q:"What weather does Kyogre summon in battle?",opts:["Harsh Sunlight","Heavy Rain","Sandstorm","Hail"],a:1},
+  {q:"What language unlocks the Regi chambers in-game?",opts:["Unown Script","Braille","Hieroglyphics","Morse Code"],a:1},
+  {q:"Which Dragon/Psychic legendary is the Eon Pokémon?",opts:["Rayquaza","Latios / Latias","Jirachi","Deoxys"],a:1},
+  {q:"Which contest stat joins Beauty, Cute, Tough, and Smart?",opts:["Cool","Fast","Strong","Brave"],a:0},
+  {q:"Who is Sinnoh's Champion with a powerful Garchomp?",opts:["Lorelei","Cynthia","Iris","Diantha"],a:1},
+  {q:"What is the parallel world where Giratina resides?",opts:["The Shadow Realm","The Distortion World","The Void","Ultra Space"],a:1},
+  {q:"What did the Gen 4 Physical/Special Split change?",opts:["Attacks split into two hits","Moves categorized by move, not type","Pokémon could have two genders","Pokédex was split in two"],a:1},
+  {q:"Which Pokémon is said to have created the universe?",opts:["Dialga","Palkia","Arceus","Darkrai"],a:2},
+  {q:"Where must you level Eevee to get Leafeon in Gen 4?",opts:["Near a Sun Stone","Near the Moss Rock","Near the Ice Rock","High friendship at night"],a:1},
+  {q:"Which baby Pokémon is a pre-evolution of Snorlax?",opts:["Munchlax","Bonsly","Mime Jr.","Happiny"],a:0},
+  {q:"Which stone evolves Gloom into Bellossom?",opts:["Leaf Stone","Sun Stone","Water Stone","Moon Stone"],a:1},
+  {q:"What does the Everstone do when held?",opts:["Doubles Defense","Prevents evolution","Increases fossil chance","Makes Pokémon heavier"],a:1},
+  {q:"Which type is completely immune to Electric moves?",opts:["Rock","Ground","Steel","Grass"],a:1},
+  {q:"How many Eeveelutions existed by end of Gen 4?",opts:["5","7","8","9"],a:1},
+  {q:"Who makes Poké Balls from Apricorns in Johto?",opts:["Prof. Elm","Kurt","Mr. Pokémon","Eusine"],a:1},
+  {q:"What was the first Pokémon Ash caught in the wild?",opts:["Pidgey","Caterpie","Metapod","Spearow"],a:1},
+  {q:"What is Jigglypuff's hobby that puts everyone to sleep?",opts:["Dancing","Singing into a marker","Drawing on faces","Eating apples"],a:1},
+  {q:"Why did Charizard refuse to obey Ash?",opts:["Naturally mean","Felt Ash was too weak after evolving","Under a spell","Wanted to return to wild"],a:1},
+  {q:"Who replaced Brock in the Orange Islands season?",opts:["Tracey Sketchit","Todd Snap","Richie","Harrison"],a:0},
+  {q:"Which Pokémon did Ash release in \"Bye Bye ___\"?",opts:["Pidgeot","Butterfree","Lapras","Pikachu"],a:1},
+  {q:"What did Ash win at Pummelo Stadium?",opts:["A Gold Trophy","Orange League Winners' Trophy","A Master Ball","A Cape"],a:1},
+  {q:"Which legendary did Ash see in the very first episode?",opts:["Lugia","Ho-Oh","Moltres","Entei"],a:1},
+  {q:"What was the GS Ball supposed to contain?",opts:["Mew","Celebi","Lugia","A Shiny Poké Ball"],a:1},
+  {q:"Which of Ash's Pokémon was a Shiny Noctowl?",opts:["Noctowl","Donphan","Heracross","Swellow"],a:0},
+  {q:"Who led the Squirtle Squad with pointy sunglasses?",opts:["Squirtle","Wartortle","Blastoise","Torkoal"],a:0},
+  {q:"Which Pokémon jumped into Misty's Poké Ball accidentally?",opts:["Togepi","Psyduck","Corsola","Poliwag"],a:1},
+  {q:"Ash's rival from Pallet Town he beat at Silver Conference?",opts:["Paul","Gary Oak","Morrison","Tyson"],a:1},
+  {q:"Who is the female protagonist from Hoenn?",opts:["Dawn","May","Serena","Iris"],a:1},
+  {q:"May's goal was winning what instead of Gym Badges?",opts:["Pokémon Contests","The Grand Prix","Beauty Pageants","Cooking Competitions"],a:0},
+  {q:"What is May's younger brother's name?",opts:["Max","Kenny","Barry","Wally"],a:0},
+  {q:"Which Hoenn starter did Brock catch?",opts:["Treecko","Torchic","Mudkip","Marshtomp"],a:2},
+  {q:"Which Ash Pokémon always had a twig in its mouth?",opts:["Corphish","Treecko / Grovyle / Sceptile","Torkoal","Glalie"],a:1},
+  {q:"Which two rival teams appear in the Hoenn anime?",opts:["Galactic & Flare","Magma & Aqua","Skull & Aether","Plasma & Neo"],a:1},
+  {q:"The anime Battle Frontier takes place in which region?",opts:["Hoenn","Kanto","Johto","Sinnoh"],a:1},
+  {q:"How many Frontier Symbols did Ash need to collect?",opts:["5","6","7","8"],a:2},
+  {q:"Which old Pokémon returned to help Ash beat Articuno?",opts:["Pikachu","Charizard","Bulbasaur","Snorlax"],a:1},
+  {q:"Who is the Battle Pyramid's Frontier Brain?",opts:["Noland","Brandon","Spencer","Tucker"],a:1},
+  {q:"What did Ash use to defeat Brandon's Regice?",opts:["Sceptile","Pikachu","Squirtle","Tauros"],a:1},
+  {q:"What title was Ash offered after winning Battle Frontier?",opts:["Pokémon Master","Frontier Brain","Elite Four Member","Gym Leader"],a:1},
+  {q:"Which Pokémon always bit or swallowed James?",opts:["Weezing","Victreebel","Cacnea","Carnivine"],a:1},
+  {q:"Which Pokémon did Jessie enter into Hoenn Contests?",opts:["Arbok","Dustox","Seviper","Wobbuffet"],a:1},
+  {q:"What is the name of Meowth's original crush?",opts:["Meowzie","Purrloin","Delcatty","Persian"],a:0},
+  {q:"What move did Charizard use to beat Blaine's Magmar?",opts:["Flamethrower","Seismic Toss","Dragon Rage","Fire Blast"],a:1},
+  {q:"Why was Ash eliminated vs Richie at Indigo Plateau?",opts:["Pikachu fainted","Charizard fell asleep","Team Rocket kidnapped Pokémon","Ran out of time"],a:1},
+  {q:"Which of Drake's Pokémon swept most of Ash's team?",opts:["Gyarados","Dragonite","Electabuzz","Ditto"],a:1},
+  {q:"How did Pikachu beat Lt. Surge's Raichu the second time?",opts:["Agility to outspeed it","Hiding in the ground","Thunder Stone mid-battle","Reflecting electricity"],a:0},
+  {q:"Which Pokémon did Ash use to melt the field vs Gary?",opts:["Squirtle","Snorlax","Charizard","Bayleef"],a:2},
+  {q:"What move did Snorlax use to beat Claire's Kingdra?",opts:["Hyper Beam","Ice Punch","Body Slam","Rest"],a:1},
+  {q:"Whose Blaziken beat Ash's Charizard at Silver Conference?",opts:["Gary","Harrison","Morrison","Tyson"],a:1},
+  {q:"Which cape-wearing Champion helped Ash at Lake of Rage?",opts:["Lance","Steven Stone","Wallace","Bruno"],a:0},
+  {q:"Tyson's unique Pokémon that beat Ash's Pikachu?",opts:["Latios","A Meowth in Boots","Metagross","Hariyama"],a:1},
+  {q:"What was Drew's signature Contest partner Pokémon?",opts:["Roselia / Roserade","Flygon","Masquerain","Absol"],a:0},
+  {q:"What evil spirit possessed Ash at the Battle Pyramid?",opts:["Dark Ash","The King of Pokélantis","Shadow Ash","Baron Ash"],a:1},
+  {q:"Which Frontier Brain battled Ash with a Milotic?",opts:["Anabel","Lucy","Greta","Tucker"],a:1},
+  {q:"How was Ash revived in Mewtwo Strikes Back?",opts:["A Phoenix Down","Tears of all the Pokémon","Mew's psychic power","Pikachu's Thunderbolt"],a:1},
+  {q:"First Mythical Pokémon Ash befriended in a movie?",opts:["Celebi","Lugia","Mew","Jirachi"],a:1},
+  {q:"Ash left Charizard to train at what location?",opts:["Charicific Valley","Dragon Den","Pallet Town","Oak's Lab"],a:0},
+  {q:"James got scammed trading a bottle cap for what?",opts:["Magikarp","Chimecho","Mime Jr.","Carnivine"],a:0},
+  {q:"What did Sceptile overcome to regain its moves?",opts:["A broken leg","A broken heart from rejection","A curse","Amnesia"],a:1},
+  {q:"Misty's Togepi evolved to Togetic to protect what?",opts:["Misty's life","The Mirage Kingdom","A group of eggs","Team Rocket"],a:1}
+]
+};

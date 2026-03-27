@@ -22,7 +22,7 @@ const http = require('http');
 const PORT = process.env.PORT || 3000;
 const PLAYERS_PER_ROOM = 5;
 const TIMER_SECS = 10;
-const TOPIC_TIMER_SECS = 10;
+const TOPIC_TIMER_SECS = 5;
 
 // ── QUESTIONS DATABASE ──
 // Same questions as your frontend, but now the server owns them.
@@ -46,7 +46,9 @@ const TOPICS = [
   {id:'lotr',name:'Lord of the Rings',icon:'💍',desc:'Middle-earth, hobbits, rings',color:'217,180,120'},
   {id:'got',name:'Game of Thrones',icon:'🐉',desc:'Westeros, houses, dragons',color:'239,68,68'},
   {id:'breakingbad',name:'Breaking Bad',icon:'🧪',desc:'Heisenberg, meth, Albuquerque',color:'74,222,128'},
-  {id:'pokemon',name:'Pokémon',icon:'⚡',desc:'Trainers, battles, Gotta catch em all',color:'250,204,21'}
+  {id:'pokemon',name:'Pokémon',icon:'⚡',desc:'Trainers, battles, Gotta catch em all',color:'250,204,21'},
+  {id:'markets',name:'Markets',icon:'📈',desc:'Stocks, crypto, scams, Wall Street',color:'34,197,94'},
+  {id:'disney',name:'Disney & Pixar',icon:'🏰',desc:'Princesses, Pixar, animated classics',color:'147,51,234'}
 ];
 
 // ── STATE ──
@@ -146,7 +148,7 @@ function createRoom(players) {
   });
 
   // Start topic selection after a short delay
-  setTimeout(() => startTopicSelection(room), 1500);
+  setTimeout(() => startTopicSelection(room), 1000);
 
   console.log(`Room ${roomId} created with ${room.players.filter(p=>!p.isBot).length} real + ${room.players.filter(p=>p.isBot).length} bot players`);
   return room;
@@ -238,7 +240,7 @@ function finishTopicSelection(room) {
   });
 
   // Build questions and start the round
-  setTimeout(() => startRound(room), 2000);
+  setTimeout(() => startRound(room), 1200);
 }
 
 function startRound(room) {
@@ -385,7 +387,7 @@ function revealAnswer(room) {
     } else {
       sendQuestion(room);
     }
-  }, 1600);
+  }, 1200);
 }
 
 function getScoreboard(room) {
@@ -667,7 +669,7 @@ function startQueueBackfill() {
     if (queue.length === 0) return;
     // Check if any player has been waiting 30+ seconds
     const now = Date.now();
-    const waitingLong = queue.some(p => p.joinedAt && (now - p.joinedAt) >= 30000);
+    const waitingLong = queue.some(p => p.joinedAt && (now - p.joinedAt) >= 12000);
     if (waitingLong && queue.length < PLAYERS_PER_ROOM) {
       const botsNeeded = PLAYERS_PER_ROOM - queue.length;
       const botNames = getBotNames(botsNeeded);

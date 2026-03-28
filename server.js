@@ -240,7 +240,7 @@ function finishTopicSelection(room) {
   });
 
   // Build questions and start the round
-  setTimeout(() => startRound(room), 1200);
+  setTimeout(() => startRound(room), 3000);
 }
 
 function startRound(room) {
